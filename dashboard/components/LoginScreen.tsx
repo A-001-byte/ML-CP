@@ -1,19 +1,20 @@
 "use client";
 
-import { useState, useRef } from 'react';
+import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { login } from '@/lib/api';
+import { useAuth } from '@/components/AuthProvider';
+import { Shield } from 'lucide-react';
 
 export default function LoginScreen() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const [waitingForFlash, setWaitingForFlash] = useState(false);
-  const videoRef = useRef<HTMLVideoElement>(null);
   const router = useRouter();
+  const { setAuth } = useAuth();
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.SyntheticEvent<HTMLFormElement>) => {
     e.preventDefault();
     setError('');
     setLoading(true);
@@ -22,190 +23,127 @@ export default function LoginScreen() {
       const result = await login(username, password);
 
       if ('token' in result) {
-        localStorage.setItem('token', result.token);
-        localStorage.setItem('role', result.role);
-        localStorage.setItem('username', username);
-        // Wait for video to reach the flash at the end
-        setWaitingForFlash(true);
-        const video = videoRef.current;
-        if (video) {
-          let rafId: number | null = null;
-          let attempts = 0;
-          const maxAttempts = 600; // ~10 seconds at 60fps
-
-          const checkFlash = () => {
-            attempts++;
-            // Redirect when video is near the end (last 0.3 seconds where flash occurs)
-            // or if we've waited too long (fallback timeout)
-            if ((video.duration && video.duration - video.currentTime <= 0.3) || attempts >= maxAttempts) {
-              router.push('/monitor');
-            } else {
-              rafId = requestAnimationFrame(checkFlash);
-            }
-          };
-
-          // Handle video metadata not loading
-          const handleError = () => {
-            if (rafId) cancelAnimationFrame(rafId);
-            router.push('/monitor');
-          };
-
-          video.addEventListener('error', handleError, { once: true });
-
-          // Start checking, with fallback if duration isn't ready
-          if (video.readyState >= 1 && video.duration) {
-            checkFlash();
-          } else {
-            video.addEventListener('loadedmetadata', () => checkFlash(), { once: true });
-            // Fallback timeout in case metadata never loads
-            setTimeout(() => {
-              if (rafId) cancelAnimationFrame(rafId);
-              router.push('/monitor');
-            }, 10000);
-          }
-        } else {
-          // Fallback if no video
-          router.push('/monitor');
-        }
+        // Store token in-memory via AuthProvider (NOT in localStorage)
+        // HttpOnly cookie is set by the backend on this request
+        setAuth(result.token, result.role, result.username ?? username);
+        router.push('/monitor');
       } else {
-        setError(result.error || 'UNRECOGNIZED BIOMETRIC/KEY');
+        setError((result as { error: string }).error || 'Invalid credentials');
       }
     } catch {
-      setError('CONNECTION FAILED: HOST UNREACHABLE');
+      setError('Unable to connect to server');
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <>
-      <style>{`
-        .bg-dark { background-color: #0a0a0c; }
-        .text-cyan { color: #00e5ff; }
-        .border-cyan { border-color: #00e5ff; }
-        .bg-cyan-dim { background-color: rgba(0, 229, 255, 0.1); }
-        .shadow-cyan { box-shadow: 0 0 30px rgba(0, 229, 255, 0.05); }
-        
-        .scanlines {
-            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), 
-                        linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
-            background-size: 100% 4px, 3px 100%; z-index: 2; pointer-events: none;
-        }
+    <div className="min-h-screen flex items-center justify-center" style={{ background: 'var(--bg-primary)' }}>
+      {/* Subtle background pattern */}
+      <div
+        className="absolute inset-0 opacity-[0.03]"
+        style={{
+          backgroundImage: `radial-gradient(circle at 1px 1px, rgba(255,255,255,0.15) 1px, transparent 0)`,
+          backgroundSize: '32px 32px',
+        }}
+      />
 
-        .weapon-scanner {
-            position: absolute; top: -100%; left: 0; width: 100%; height: 200%;
-            background: linear-gradient(to bottom, transparent 45%, rgba(0, 229, 255, 0.1) 50%, #00e5ff 50%, rgba(0, 229, 255, 0.1) 50.5%, transparent 55%);
-            animation: scan 4s linear infinite; pointer-events: none; opacity: 0.6;
-        }
-
-        @keyframes scan { 0% { transform: translateY(0); } 100% { transform: translateY(100%); } }
-        
-        @keyframes glitch {
-            0% { transform: translate(0) }
-            20% { transform: translate(-2px, 2px) }
-            40% { transform: translate(-2px, -2px) }
-            60% { transform: translate(2px, 2px) }
-            80% { transform: translate(2px, -2px) }
-            100% { transform: translate(0) }
-        }
-        .glitch-anim { animation: glitch 0.2s ease-in-out; }
-        .pulse-anim { animation: pulse 1s infinite; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-      `}</style>
-
-      <div className="min-h-screen bg-dark flex items-center justify-center relative overflow-hidden font-sans">
-
-        {/* Background Video Element */}
-        <video
-          ref={videoRef}
-          autoPlay
-          loop
-          muted
-          playsInline
-          className="absolute inset-0 w-full h-full object-cover opacity-50 z-0"
-        >
-          {/* Place your video in the /public folder of your Next.js app */}
-          <source src="/surveillance-bg.mp4" type="video/mp4" />
-        </video>
-
-        {/* Video Overlay (darkens the video so the UI remains readable) */}
-        <div className="absolute inset-0 bg-[#0a0a0c]/40 z-1 pointer-events-none"></div>
-
-        <div className="scanlines"></div>
-
-        {/* Main Login Card */}
-        <div className="relative z-10 bg-[#0a0a0c]/80 backdrop-blur-md border border-cyan/30 p-10 w-[380px] rounded shadow-cyan overflow-hidden">
-          <div className="weapon-scanner"></div>
-
-          <div className="text-center mb-8 relative z-20">
-            <svg className="w-10 h-10 mx-auto fill-none stroke-[#00e5ff] stroke-2 mb-3 drop-shadow-[0_0_8px_rgba(0,229,255,0.8)]" viewBox="0 0 24 24">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
-              <circle cx="12" cy="11" r="3"></circle>
-            </svg>
-            <h1 className="text-xl tracking-[3px] font-semibold text-white mb-1">THREATSENSE</h1>
-            <p className="font-mono text-[10px] text-zinc-400 tracking-[1px]">{'// SECURE UPLINK //'}</p>
-          </div>
-
-          {error && (
-            <div className="glitch-anim border-l-2 border-red-500 bg-red-500/10 p-2.5 font-mono text-xs text-red-500 mb-5 relative z-20">
-              ⚠️ ERR 401: {error}
-            </div>
-          )}
-
-          <form onSubmit={handleSubmit} className="space-y-5 relative z-20">
-            <div className="space-y-1.5 flex flex-col">
-              <label htmlFor="username" className="font-mono text-[11px] text-cyan uppercase">Operator ID 👤</label>
-              <input
-                id="username"
-                type="text"
-                autoComplete="username"
-                placeholder="SYS_ADMIN_01"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                className="w-full p-2.5 bg-black/60 border border-zinc-800 text-white font-mono text-sm focus:outline-none focus:border-cyan transition-colors"
-                required
-              />
-            </div>
-
-            <div className="space-y-1.5 flex flex-col">
-              <label htmlFor="password" className="font-mono text-[11px] text-cyan uppercase">Passkey 🔑</label>
-              <input
-                id="password"
-                type="password"
-                autoComplete="current-password"
-                placeholder="••••••••"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className="w-full p-2.5 bg-black/60 border border-zinc-800 text-white font-mono text-sm focus:outline-none focus:border-cyan transition-colors"
-                required
-              />
-            </div>
-
-            <button
-              type="submit"
-              disabled={loading || waitingForFlash}
-              className="w-full p-3 bg-black/40 border border-cyan text-cyan font-mono uppercase cursor-pointer transition-all hover:bg-cyan-dim hover:shadow-[0_0_15px_rgba(0,229,255,0.4)] disabled:border-zinc-600 disabled:text-zinc-600 flex items-center justify-center mt-2"
-            >
-              {waitingForFlash ? (
-                <span className="pulse-anim">Syncing...</span>
-              ) : loading ? (
-                <span className="pulse-anim">Authenticating...</span>
-              ) : (
-                <span className="tracking-[1px] font-bold">Initialize Connection</span>
-              )}
-            </button>
-          </form>
-
-          {process.env.NODE_ENV === 'development' && (
-            <div className="mt-6 text-center relative z-20">
-              <p className="text-[10px] text-zinc-600 font-mono">
-                DEV OVERRIDE: admin / admin
+      <div className="relative w-full max-w-[380px] mx-4">
+        {/* Login Card */}
+        <div className="panel">
+          <div className="p-8">
+            {/* Brand */}
+            <div className="text-center mb-8">
+              <div className="w-12 h-12 rounded-lg mx-auto mb-4 flex items-center justify-center" style={{ background: 'var(--accent-dim)', border: '1px solid rgba(59, 130, 246, 0.2)' }}>
+                <Shield className="w-6 h-6" style={{ color: 'var(--accent)' }} />
+              </div>
+              <h1 className="text-lg font-semibold tracking-wide" style={{ color: 'var(--text-primary)' }}>
+                ThreatSense AI
+              </h1>
+              <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
+                Surveillance Control Platform
               </p>
             </div>
-          )}
+
+            {/* Error */}
+            {error && (
+              <div className="mb-5 p-3 rounded-md text-sm animate-fade-in" style={{ background: 'var(--danger-dim)', border: '1px solid var(--danger-border)', color: 'var(--danger)' }}>
+                {error}
+              </div>
+            )}
+
+            {/* Form */}
+            <form onSubmit={handleSubmit} className="space-y-4">
+              <div>
+                <label htmlFor="username" className="block text-xs font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>
+                  Username
+                </label>
+                <input
+                  id="username"
+                  type="text"
+                  autoComplete="username"
+                  placeholder="Enter username"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  className="w-full px-3 py-2.5 rounded-md text-sm transition-colors focus:outline-none"
+                  style={{
+                    background: 'var(--bg-primary)',
+                    border: '1px solid var(--border-strong)',
+                    color: 'var(--text-primary)',
+                  }}
+                  onFocus={(e) => { e.target.style.borderColor = 'var(--accent)'; }}
+                  onBlur={(e) => { e.target.style.borderColor = 'var(--border-strong)'; }}
+                  required
+                />
+              </div>
+
+              <div>
+                <label htmlFor="password" className="block text-xs font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>
+                  Password
+                </label>
+                <input
+                  id="password"
+                  type="password"
+                  autoComplete="current-password"
+                  placeholder="Enter password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="w-full px-3 py-2.5 rounded-md text-sm transition-colors focus:outline-none"
+                  style={{
+                    background: 'var(--bg-primary)',
+                    border: '1px solid var(--border-strong)',
+                    color: 'var(--text-primary)',
+                  }}
+                  onFocus={(e) => { e.target.style.borderColor = 'var(--accent)'; }}
+                  onBlur={(e) => { e.target.style.borderColor = 'var(--border-strong)'; }}
+                  required
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={loading}
+                className="btn-primary w-full py-2.5 rounded-md text-sm font-medium transition-all disabled:opacity-50"
+                style={{
+                  background: 'var(--accent)',
+                  border: 'none',
+                  color: 'white',
+                  cursor: loading ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {loading ? 'Signing in...' : 'Sign In'}
+              </button>
+            </form>
+          </div>
+
+          {/* Footer */}
+          <div className="px-8 py-3" style={{ borderTop: '1px solid var(--border)', background: 'rgba(255,255,255,0.01)' }}>
+            <p className="text-center text-[10px]" style={{ color: 'var(--text-dim)' }}>
+              Authorized personnel only
+            </p>
+          </div>
         </div>
       </div>
-    </>
+    </div>
   );
 }

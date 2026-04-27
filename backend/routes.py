@@ -1,644 +1,971 @@
-import jwt
-from datetime import datetime, timedelta, timezone
-from functools import wraps
-from flask import Blueprint, request, jsonify, current_app, Response
-from backend.database import get_db_connection, add_alert, add_incident
-from core.stream_manager import stream_manager
+"""
+routes.py
+─────────
+FastAPI API router — all REST endpoints for the ThreatSense AI backend.
+
+Replaces the old Flask Blueprint.  Every endpoint preserves the same
+URL path and response shape so the frontend remains compatible.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import csv
+import io
 import time
+import re
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 from werkzeug.security import check_password_hash, generate_password_hash
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 
-limiter = Limiter(key_func=get_remote_address)
-api_bp = Blueprint('api', __name__)
+from backend.auth import (
+    COOKIE_NAME,
+    create_token,
+    get_current_user,
+    get_optional_user,
+    require_roles,
+    verify_token,
+    _extract_token,
+)
+from backend.database import add_alert, add_incident, get_db_connection
+from backend.detection_zone import detection_zone
+from core.stream_manager import stream_manager
 
-MAX_LIMIT = 100
+router = APIRouter(prefix="/api")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+INCIDENTS_DIR = PROJECT_ROOT / "logs" / "incidents"
+EVAL_DIR = PROJECT_ROOT / "docs" / "evaluation" / "eval"
+EVAL_PLOTS = {
+    "confusion_matrix.png": "Confusion Matrix",
+    "confusion_matrix_normalized.png": "Normalized Confusion Matrix",
+    "BoxPR_curve.png": "Precision-Recall Curve",
+    "BoxP_curve.png": "Precision Curve",
+    "BoxR_curve.png": "Recall Curve",
+    "BoxF1_curve.png": "F1 Curve",
+}
 
-
-def token_required(roles=None, optional=False):
-    """
-    Decorator to protect endpoints with PyJWT authentication.
-    Optionally enforces role-based access control.
-    Roles: admin, security, operator, viewer
-    If optional=True, allows unauthenticated access but still validates tokens if present.
-    """
-    if roles is None:
-        roles = ['admin', 'security', 'operator', 'viewer']
-
-    def decorator(f):
-        @wraps(f)
-        def decorated(*args, **kwargs):
-            token = None
-
-            # Check for token in headers
-            if 'Authorization' in request.headers:
-                parts = request.headers['Authorization'].split()
-                if len(parts) == 2 and parts[0] == 'Bearer':
-                    token = parts[1]
-
-            if not token:
-                if optional:
-                    # Allow unauthenticated access
-                    return f(*args, **kwargs)
-                return jsonify({'error': 'Token is missing'}), 401
-
-            try:
-                # Decode the token
-                data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=["HS256"])
-                current_user_role = data.get('role')
-
-                # Verify role
-                if roles and current_user_role not in roles:
-                    return jsonify({'error': 'Permission denied. Invalid role.'}), 403
-
-            except jwt.ExpiredSignatureError:
-                # If optional and NO token was provided, allow anonymous access
-                # But if a token WAS provided (even if invalid/expired), reject
-                if optional and not token:
-                    return f(*args, **kwargs)
-                return jsonify({'error': 'Token has expired'}), 401
-            except jwt.InvalidTokenError:
-                # If optional and NO token was provided, allow anonymous access
-                # But if a token WAS provided (even if invalid), reject
-                if optional and not token:
-                    return f(*args, **kwargs)
-                return jsonify({'error': 'Invalid token'}), 401
-
-            return f(*args, **kwargs)
-        return decorated
-    return decorator
+# ── Rate-limit state (simple in-memory, per-IP) ─────────────────────────────
+# For production, swap with Redis-backed slowapi.
+_rate_limits: dict[str, list[float]] = {}
+RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMIT_MAX = 10  # requests per window
 
 
-@api_bp.route('/login', methods=['POST'])
-@limiter.limit("5 per minute")
-def login():
-    data = request.get_json()
-    if not data or 'username' not in data or 'password' not in data:
-        return jsonify({'error': 'Missing username or password'}), 400
+def _check_rate_limit(request: Request, max_requests: int = RATE_LIMIT_MAX) -> None:
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    hits = _rate_limits.setdefault(ip, [])
+    hits[:] = [t for t in hits if now - t < RATE_LIMIT_WINDOW]
+    if len(hits) >= max_requests:
+        raise HTTPException(status_code=429, detail="Too many requests")
+    hits.append(now)
 
-    username = data['username']
-    password = data['password']
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTH
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+    email: Optional[str] = None
+
+
+@router.post("/login")
+async def login(body: LoginRequest, request: Request):
+    _check_rate_limit(request, max_requests=5)
 
     conn = get_db_connection()
-    user = conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+    user = conn.execute(
+        "SELECT * FROM users WHERE username = ?", (body.username,)
+    ).fetchone()
     conn.close()
 
-    if user and check_password_hash(user['password_hash'], password):
-        # Generate PyJWT token
-        token = jwt.encode({
-            'username': user['username'],
-            'role': user['role'],
-            'exp': datetime.now(timezone.utc) + timedelta(hours=24)
-        }, current_app.config['SECRET_KEY'], algorithm="HS256")
+    if user and check_password_hash(user["password_hash"], body.password):
+        token = create_token(user["username"], user["role"])
+        response = JSONResponse({
+            "message": "Login successful",
+            "token": token,
+            "role": user["role"],
+            "username": user["username"],
+        })
+        # HttpOnly cookie — JS cannot read this, eliminates XSS token theft
+        response.set_cookie(
+            key=COOKIE_NAME,
+            value=token,
+            httponly=True,
+            samesite="strict",
+            max_age=86400,    # 24 h — matches TOKEN_EXPIRE_HOURS
+            secure=False,     # flip to True in production (HTTPS)
+            path="/",
+        )
+        return response
 
-        return jsonify({
-            'message': 'Login successful',
-            'token': token,
-            'role': user['role']
-        }), 200
-
-    return jsonify({'error': 'Invalid username or password'}), 401
+    raise HTTPException(status_code=401, detail="Invalid username or password")
 
 
-@api_bp.route('/register', methods=['POST'])
-@limiter.limit("5 per minute")
-def register():
-    data = request.get_json()
-    if not data:
-        return jsonify({'message': 'Missing request body'}), 400
+@router.post("/logout")
+async def logout():
+    """Clear the HttpOnly auth cookie."""
+    response = JSONResponse({"message": "Logged out"})
+    response.delete_cookie(key=COOKIE_NAME, path="/")
+    return response
 
-    username = (data.get('username') or '').strip()
-    email = (data.get('email') or '').strip()
-    password = data.get('password') or ''
 
-    if not username or not password:
-        return jsonify({'message': 'Missing username or password'}), 400
+@router.post("/register")
+async def register(body: RegisterRequest, request: Request):
+    _check_rate_limit(request, max_requests=5)
+
+    username = body.username.strip()
+    if not username or not body.password:
+        raise HTTPException(status_code=400, detail="Missing username or password")
 
     conn = get_db_connection()
     try:
-        existing = conn.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
+        existing = conn.execute(
+            "SELECT id FROM users WHERE username = ?", (username,)
+        ).fetchone()
         if existing:
-            return jsonify({'message': 'Username already exists'}), 409
+            raise HTTPException(status_code=409, detail="Username already exists")
 
-        cursor = conn.cursor()
-        cursor.execute(
-            'INSERT INTO users (username, password_hash, role, status, last_active) VALUES (?, ?, ?, ?, ?)',
-            (username, generate_password_hash(password), 'operator', 'Active', 'Just now')
+        conn.execute(
+            "INSERT INTO users (username, password_hash, role, status, last_active) VALUES (?, ?, ?, ?, ?)",
+            (username, generate_password_hash(body.password), "operator", "Active", "Just now"),
         )
         conn.commit()
     finally:
         conn.close()
 
-    # Email is accepted for API parity but not stored in current schema.
-    return jsonify({'message': 'Registration successful', 'username': username}), 201
+    return {"message": "Registration successful", "username": username}
 
 
-@api_bp.route('/me', methods=['GET'])
-@token_required()
-def get_me():
-    """Return the current user's profile from their JWT."""
-    token = None
-    if 'Authorization' in request.headers:
-        parts = request.headers['Authorization'].split()
-        if len(parts) == 2 and parts[0] == 'Bearer':
-            token = parts[1]
-    if not token:
-        return jsonify({'error': 'Token is missing'}), 401
-    try:
-        data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
-        return jsonify({'username': data.get('username'), 'role': data.get('role')}), 200
-    except Exception:
-        return jsonify({'error': 'Invalid token'}), 401
+@router.get("/me")
+async def get_me(user: dict = Depends(get_current_user)):
+    return {"username": user.get("username"), "role": user.get("role")}
 
-@api_bp.route('/alerts', methods=['GET'])
-@token_required(roles=['admin', 'security', 'operator', 'viewer'], optional=True)
-def get_alerts():
-    limit = request.args.get('limit', 50, type=int)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ALERTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+MAX_LIMIT = 100
+
+
+@router.get("/alerts")
+async def get_alerts(limit: int = 50, _user: dict = Depends(get_current_user)):
     limit = max(1, min(limit, MAX_LIMIT))
-
     conn = get_db_connection()
-    alerts = conn.execute('SELECT * FROM alerts ORDER BY timestamp DESC LIMIT ?', (limit,)).fetchall()
+    alerts = conn.execute(
+        "SELECT * FROM alerts ORDER BY timestamp DESC LIMIT ?", (limit,)
+    ).fetchall()
     conn.close()
+    return [dict(row) for row in alerts]
 
-    return jsonify([dict(row) for row in alerts]), 200
+
+class CreateAlertRequest(BaseModel):
+    event_type: str
+    risk_score: float
+    person_id: str = "UNKNOWN"
+    risk_level: str = "low"
+    camera_id: str = "CAM-01"
+    location: str = "Main Entrance"
+    status: str = "Active"
 
 
-@api_bp.route('/alerts', methods=['POST'])
-@token_required(roles=['admin', 'security', 'operator'])
-def create_alert():
-    """Create a new alert (primarily for testing and manual insertion)."""
-    data = request.get_json()
-    if not data:
-        return jsonify({'error': 'Missing request body'}), 400
-
-    # Required fields
-    event_type = data.get('event_type')
-    risk_score = data.get('risk_score')
-    
-    if not event_type or risk_score is None:
-        return jsonify({'error': 'Missing required fields: event_type, risk_score'}), 400
-
-    # Optional fields with defaults
-    person_id = data.get('person_id', 'UNKNOWN')
-    risk_level = data.get('risk_level', 'low')
-    camera_id = data.get('camera_id', 'CAM-01')
-    location = data.get('location', 'Main Entrance')
-    status = data.get('status', 'Active')
-
-    # Validate risk_score before calling add_alert
-    try:
-        risk_score_float = float(risk_score)
-    except (ValueError, TypeError):
-        return jsonify({'error': 'Invalid risk_score: must be a number'}), 400
-
+@router.post("/alerts", status_code=201)
+async def create_alert(
+    body: CreateAlertRequest,
+    user: dict = Depends(require_roles("admin", "security", "operator")),
+):
     try:
         alert_id = add_alert(
-            person_id=person_id,
-            event_type=event_type,
-            risk_score=risk_score_float,
-            risk_level=risk_level,
-            camera_id=camera_id,
-            location=location,
-            status=status
+            person_id=body.person_id,
+            event_type=body.event_type,
+            risk_score=body.risk_score,
+            risk_level=body.risk_level,
+            camera_id=body.camera_id,
+            location=body.location,
+            status=body.status,
         )
-        return jsonify({'message': 'Alert created', 'id': alert_id}), 201
+        return {"message": "Alert created", "id": alert_id}
     except ValueError as e:
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        current_app.logger.exception("Failed to create alert")
-        return jsonify({'error': 'Internal server error'}), 500
+        raise HTTPException(status_code=400, detail=str(e))
 
 
-@api_bp.route('/incidents', methods=['GET'])
-@token_required(roles=['admin', 'security', 'operator', 'viewer'], optional=True)
-def get_incidents():
-    status = request.args.get('status')
-    limit = request.args.get('limit', 100, type=int)
-    limit = max(1, min(limit, 1000))
-
+@router.post("/alerts/{alert_id}/dismiss")
+async def dismiss_alert(
+    alert_id: int,
+    user: dict = Depends(require_roles("admin", "security", "operator")),
+):
     conn = get_db_connection()
-    if status:
-        incidents = conn.execute('SELECT * FROM incidents WHERE status = ? ORDER BY created_at DESC LIMIT ?', (status, limit)).fetchall()
-    else:
-        incidents = conn.execute('SELECT * FROM incidents ORDER BY created_at DESC LIMIT ?', (limit,)).fetchall()
-    conn.close()
-
-    return jsonify([dict(row) for row in incidents]), 200
-
-
-@api_bp.route('/incidents', methods=['POST'])
-@token_required(roles=['admin', 'security', 'operator'])
-def create_incident():
-    """Create a new incident (primarily for testing and manual insertion)."""
-    data = request.get_json()
-    if not data:
-        return jsonify({'error': 'Missing request body'}), 400
-
-    # Required fields
-    title = data.get('title')
-    if not title:
-        return jsonify({'error': 'Missing required field: title'}), 400
-
-    # Optional fields with defaults
-    description = data.get('description', '')
-    event_type = data.get('event_type', 'Manual Entry')
-    location = data.get('location', 'Main Entrance')
-    risk_level = data.get('risk_level', 'low')
-    status = data.get('status', 'open')
-
-    try:
-        incident_id = add_incident(
-            title=title,
-            description=description,
-            event_type=event_type,
-            location=location,
-            risk_level=risk_level,
-            status=status
-        )
-        return jsonify({'message': 'Incident created', 'id': incident_id}), 201
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        current_app.logger.exception("Failed to create incident")
-        return jsonify({'error': 'Internal server error'}), 500
-
-
-@api_bp.route('/stats', methods=['GET'])
-@token_required(optional=True)
-def get_stats():
-    conn = get_db_connection()
-
-    total_alerts = conn.execute('SELECT COUNT(*) FROM alerts').fetchone()[0]
-    total_incidents = conn.execute('SELECT COUNT(*) FROM incidents').fetchone()[0]
-    active_incidents = conn.execute("SELECT COUNT(*) FROM incidents WHERE status NOT IN ('Resolved', 'False Alarm')").fetchone()[0]
-
-    # recent high risk alerts
-    high_risk_alerts = conn.execute('SELECT COUNT(*) FROM alerts WHERE risk_score >= 0.8').fetchone()[0]
-
-    # active tracks: count distinct persons with active (non-resolved/dismissed) alerts
-    active_tracks = conn.execute(
-        "SELECT COUNT(DISTINCT person_id) FROM alerts WHERE status NOT IN ('Resolved', 'Dismissed')"
-    ).fetchone()[0]
-
-    conn.close()
-
-    # Pipeline metrics from stream_manager
-    health = stream_manager.health()
-    fps = health.get('fps')
-    pipeline_running = health.get('last_frame_ts') is not None
-    last_frame_age = None
-    if health.get('last_frame_ts'):
-        last_frame_age = round(time.time() - health['last_frame_ts'], 1)
-
-    return jsonify({
-        'total_alerts': total_alerts,
-        'total_incidents': total_incidents,
-        'active_incidents': active_incidents,
-        'high_risk_alerts': high_risk_alerts,
-        'active_tracks': active_tracks,
-        'pipeline_fps': round(fps, 1) if fps else None,
-        'pipeline_running': pipeline_running,
-        'pipeline_frames': health.get('frames', 0),
-        'last_frame_age_s': last_frame_age,
-    }), 200
-
-
-@api_bp.route('/users', methods=['GET'])
-@token_required(roles=['admin'])
-def get_users():
-    conn = get_db_connection()
-    users = conn.execute('SELECT id, username, role, status, last_active FROM users ORDER BY id').fetchall()
-    conn.close()
-
-    return jsonify([dict(row) for row in users]), 200
-
-
-@api_bp.route('/video_feed')
-def video_feed():
-    """Video streaming route. Returns MJPEG stream.
-    
-    Supports authentication via:
-    - Authorization header (Bearer token)
-    - Query parameter (?token=xxx) for use with img/video tags
-    If no token is provided, stream is still allowed (dev-friendly).
-    """
-    # Check for token in header or query param
-    token = None
-    if 'Authorization' in request.headers:
-        parts = request.headers['Authorization'].split()
-        if len(parts) == 2 and parts[0] == 'Bearer':
-            token = parts[1]
-    
-    # Fallback to query parameter for img/video tag support
-    if not token:
-        token = request.args.get('token')
-    
-    if token:
-        try:
-            jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=["HS256"])
-        except jwt.ExpiredSignatureError:
-            return jsonify({'error': 'Token has expired'}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({'error': 'Invalid token'}), 401
-
-    def generate():
-        while True:
-            frame_bytes = stream_manager.get_frame_bytes()
-            if frame_bytes is None:
-                time.sleep(0.05)  # wait for first frame
-                continue
-            
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            time.sleep(0.016)  # ~60 FPS streaming rate (browser will throttle if needed)
-
-    return Response(generate(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-
-@api_bp.route('/frame')
-def single_frame():
-    """Return the latest frame as a single JPEG for fallback polling."""
-    token = None
-    if 'Authorization' in request.headers:
-        parts = request.headers['Authorization'].split()
-        if len(parts) == 2 and parts[0] == 'Bearer':
-            token = parts[1]
-    if not token:
-        token = request.args.get('token')
-    if token:
-        try:
-            jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=["HS256"])
-        except jwt.ExpiredSignatureError:
-            return jsonify({'error': 'Token has expired'}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({'error': 'Invalid token'}), 401
-
-    frame_bytes = stream_manager.get_frame_bytes()
-    if frame_bytes is None:
-        return jsonify({'error': 'No frame available'}), 503
-    return Response(frame_bytes, mimetype='image/jpeg')
-
-
-@api_bp.route('/system_status', methods=['GET'])
-def system_status():
-    """Lightweight health probe for dashboard auto-start logic."""
-    health = stream_manager.health()
-    now = time.time()
-    last_ts = health.get("last_frame_ts") or 0
-    pipeline_running = (now - last_ts) < 5
-    camera_connected = pipeline_running
-    fps = health.get("fps") or 0
-    return jsonify({
-        "pipeline_running": bool(pipeline_running),
-        "camera_connected": bool(camera_connected),
-        "fps": round(fps, 1) if fps else 0,
-        "last_frame_ts": last_ts,
-    }), 200
-
-
-# ==================== ALERT ACTIONS ====================
-
-@api_bp.route('/alerts/<int:alert_id>/dismiss', methods=['POST'])
-@token_required(roles=['admin', 'security', 'operator'])
-def dismiss_alert(alert_id):
-    """Dismiss an alert - removes it from active alerts."""
-    conn = get_db_connection()
-    result = conn.execute('UPDATE alerts SET status = ? WHERE id = ?', ('Dismissed', alert_id))
+    result = conn.execute("UPDATE alerts SET status = ? WHERE id = ?", ("Dismissed", alert_id))
     conn.commit()
-    rows_affected = result.rowcount
+    rows = result.rowcount
     conn.close()
-    
-    if rows_affected == 0:
-        return jsonify({'error': 'Alert not found'}), 404
-    return jsonify({'message': 'Alert dismissed', 'id': alert_id}), 200
+    if rows == 0:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"message": "Alert dismissed", "id": alert_id}
 
 
-@api_bp.route('/alerts/<int:alert_id>/acknowledge', methods=['POST'])
-@token_required(roles=['admin', 'security', 'operator'])
-def acknowledge_alert(alert_id):
-    """Acknowledge an alert - marks it as under review."""
+@router.post("/alerts/{alert_id}/acknowledge")
+async def acknowledge_alert(
+    alert_id: int,
+    user: dict = Depends(require_roles("admin", "security", "operator")),
+):
     conn = get_db_connection()
-    result = conn.execute('UPDATE alerts SET status = ? WHERE id = ?', ('Under Review', alert_id))
+    result = conn.execute("UPDATE alerts SET status = ? WHERE id = ?", ("Under Review", alert_id))
     conn.commit()
-    rows_affected = result.rowcount
+    rows = result.rowcount
     conn.close()
-    
-    if rows_affected == 0:
-        return jsonify({'error': 'Alert not found'}), 404
-    return jsonify({'message': 'Alert acknowledged', 'id': alert_id}), 200
+    if rows == 0:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"message": "Alert acknowledged", "id": alert_id}
 
 
-@api_bp.route('/alerts/<int:alert_id>/resolve', methods=['POST'])
-@token_required(roles=['admin', 'security', 'operator'])
-def resolve_alert(alert_id):
-    """Resolve an alert - marks it as resolved."""
+@router.post("/alerts/{alert_id}/resolve")
+async def resolve_alert(
+    alert_id: int,
+    user: dict = Depends(require_roles("admin", "security", "operator")),
+):
     conn = get_db_connection()
-    result = conn.execute('UPDATE alerts SET status = ? WHERE id = ?', ('Resolved', alert_id))
+    result = conn.execute("UPDATE alerts SET status = ? WHERE id = ?", ("Resolved", alert_id))
     conn.commit()
-    rows_affected = result.rowcount
+    rows = result.rowcount
     conn.close()
-    
-    if rows_affected == 0:
-        return jsonify({'error': 'Alert not found'}), 404
-    return jsonify({'message': 'Alert resolved', 'id': alert_id}), 200
+    if rows == 0:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"message": "Alert resolved", "id": alert_id}
 
 
-@api_bp.route('/alerts/bulk-dismiss', methods=['POST'])
-@token_required(roles=['admin', 'security', 'operator'])
-def bulk_dismiss_alerts():
-    """Dismiss all resolved alerts in a single operation."""
+@router.post("/alerts/bulk-dismiss")
+async def bulk_dismiss_alerts(
+    user: dict = Depends(require_roles("admin", "security", "operator")),
+):
     conn = get_db_connection()
     result = conn.execute(
         "UPDATE alerts SET status = 'Dismissed' WHERE status IN ('Resolved', 'Active')"
     )
     conn.commit()
-    rows_affected = result.rowcount
+    rows = result.rowcount
     conn.close()
-    return jsonify({'message': f'{rows_affected} alerts dismissed', 'count': rows_affected}), 200
+    return {"message": f"{rows} alerts dismissed", "count": rows}
 
-# ==================== INCIDENT ACTIONS ====================
 
-@api_bp.route('/incidents/<int:incident_id>/resolve', methods=['POST'])
-@token_required(roles=['admin', 'security', 'operator'])
-def resolve_incident(incident_id):
-    """Resolve an incident - marks it as resolved with timestamp."""
+# ══════════════════════════════════════════════════════════════════════════════
+# INCIDENTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/incidents")
+async def get_incidents(
+    status: Optional[str] = None,
+    limit: int = 100,
+    _user: dict = Depends(get_current_user),
+):
+    limit = max(1, min(limit, 1000))
     conn = get_db_connection()
-    result = conn.execute(
-        'UPDATE incidents SET status = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ?',
-        ('Resolved', incident_id)
-    )
-    conn.commit()
-    rows_affected = result.rowcount
+    if status:
+        incidents = conn.execute(
+            "SELECT * FROM incidents WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+            (status, limit),
+        ).fetchall()
+    else:
+        incidents = conn.execute(
+            "SELECT * FROM incidents ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
     conn.close()
-    
-    if rows_affected == 0:
-        return jsonify({'error': 'Incident not found'}), 404
-    return jsonify({'message': 'Incident resolved', 'id': incident_id}), 200
+    return [dict(row) for row in incidents]
 
 
-@api_bp.route('/incidents/<int:incident_id>/escalate', methods=['POST'])
-@token_required(roles=['admin', 'security', 'operator'])
-def escalate_incident(incident_id):
-    """Escalate an incident - raises its priority."""
+class CreateIncidentRequest(BaseModel):
+    title: str
+    description: str = ""
+    event_type: str = "Manual Entry"
+    location: str = "Main Entrance"
+    risk_level: str = "low"
+    status: str = "open"
+
+
+@router.post("/incidents", status_code=201)
+async def create_incident(
+    body: CreateIncidentRequest,
+    user: dict = Depends(require_roles("admin", "security", "operator")),
+):
+    try:
+        incident_id = add_incident(
+            title=body.title,
+            description=body.description,
+            event_type=body.event_type,
+            location=body.location,
+            risk_level=body.risk_level,
+            status=body.status,
+        )
+        return {"message": "Incident created", "id": incident_id}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/incidents/{incident_id}")
+async def get_incident(
+    incident_id: int,
+    _user: dict = Depends(get_current_user),
+):
     conn = get_db_connection()
-    # Also upgrade risk_level to high if not already
-    result = conn.execute(
-        "UPDATE incidents SET status = ?, risk_level = CASE WHEN risk_level = 'low' THEN 'medium' WHEN risk_level = 'medium' THEN 'high' ELSE risk_level END WHERE id = ?",
-        ('Escalated', incident_id)
-    )
-    conn.commit()
-    rows_affected = result.rowcount
+    incident = conn.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
     conn.close()
-    
-    if rows_affected == 0:
-        return jsonify({'error': 'Incident not found'}), 404
-    return jsonify({'message': 'Incident escalated', 'id': incident_id}), 200
-
-
-@api_bp.route('/incidents/<int:incident_id>', methods=['GET'])
-@token_required(roles=['admin', 'security', 'operator', 'viewer'], optional=True)
-def get_incident(incident_id):
-    """Get a single incident by ID."""
-    conn = get_db_connection()
-    incident = conn.execute('SELECT * FROM incidents WHERE id = ?', (incident_id,)).fetchone()
-    conn.close()
-    
     if not incident:
-        return jsonify({'error': 'Incident not found'}), 404
-    return jsonify(dict(incident)), 200
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return dict(incident)
 
 
-# ==================== USER MANAGEMENT ====================
+def _safe_file_under(path: Path, parent: Path) -> Path | None:
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(parent.resolve())
+        return resolved if resolved.is_file() else None
+    except Exception:
+        return None
 
-@api_bp.route('/users', methods=['POST'])
-@token_required(roles=['admin'])
-def create_user():
-    """Create a new user."""
-    from werkzeug.security import generate_password_hash
-    
-    data = request.get_json()
-    if not data:
-        return jsonify({'error': 'Missing request body'}), 400
-    
-    username = data.get('username')
-    password = data.get('password')
-    role = data.get('role', 'viewer')
-    
-    if not username or not password:
-        return jsonify({'error': 'Missing required fields: username, password'}), 400
-    
-    if role not in ['admin', 'operator', 'viewer', 'security']:
-        return jsonify({'error': 'Invalid role. Must be: admin, operator, viewer, security'}), 400
-    
+
+def _extract_person_id(incident: dict) -> str | None:
+    if incident.get("person_id"):
+        return str(incident["person_id"])
+    text = f"{incident.get('title') or ''} {incident.get('description') or ''}"
+    match = re.search(r"\bID\s+([A-Za-z0-9_-]+)", text)
+    return match.group(1) if match else None
+
+
+def _resolve_incident_clip(incident: dict) -> Path | None:
+    clip_path = incident.get("clip_path")
+    if clip_path:
+        candidate = Path(clip_path)
+        if not candidate.is_absolute():
+            candidate = PROJECT_ROOT / candidate
+        safe = _safe_file_under(candidate, INCIDENTS_DIR)
+        if safe:
+            return safe
+
+    if not INCIDENTS_DIR.exists():
+        return None
+
+    person_id = _extract_person_id(incident)
+    if not person_id:
+        return None
+    clips = sorted(INCIDENTS_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+    clips = [p for p in clips if f"person{person_id}_" in p.name]
+    return clips[0] if clips else None
+
+
+@router.get("/incidents/{incident_id}/clip")
+async def get_incident_clip(incident_id: int, request: Request):
+    token = _extract_token(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    verify_token(token)
+
     conn = get_db_connection()
-    
-    # Check if username already exists
-    existing = conn.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
+    incident = conn.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
+    conn.close()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    clip = _resolve_incident_clip(dict(incident))
+    if not clip:
+        raise HTTPException(status_code=404, detail="Incident clip not found")
+
+    return FileResponse(
+        path=str(clip),
+        media_type="video/mp4",
+        filename=clip.name,
+        headers={"Accept-Ranges": "bytes"},
+    )
+
+
+@router.post("/incidents/{incident_id}/resolve")
+async def resolve_incident(
+    incident_id: int,
+    user: dict = Depends(require_roles("admin", "security", "operator")),
+):
+    conn = get_db_connection()
+    result = conn.execute(
+        "UPDATE incidents SET status = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ?",
+        ("Resolved", incident_id),
+    )
+    conn.commit()
+    rows = result.rowcount
+    conn.close()
+    if rows == 0:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return {"message": "Incident resolved", "id": incident_id}
+
+
+@router.post("/incidents/{incident_id}/escalate")
+async def escalate_incident(
+    incident_id: int,
+    user: dict = Depends(require_roles("admin", "security", "operator")),
+):
+    conn = get_db_connection()
+    result = conn.execute(
+        "UPDATE incidents SET status = ?, risk_level = CASE "
+        "WHEN risk_level = 'low' THEN 'medium' "
+        "WHEN risk_level = 'medium' THEN 'high' "
+        "ELSE risk_level END WHERE id = ?",
+        ("Escalated", incident_id),
+    )
+    conn.commit()
+    rows = result.rowcount
+    conn.close()
+    if rows == 0:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return {"message": "Incident escalated", "id": incident_id}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STATS & SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/stats")
+async def get_stats(_user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    total_alerts = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+    total_incidents = conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0]
+    active_incidents = conn.execute(
+        "SELECT COUNT(*) FROM incidents WHERE status NOT IN ('Resolved', 'False Alarm')"
+    ).fetchone()[0]
+    high_risk_alerts = conn.execute(
+        "SELECT COUNT(*) FROM alerts WHERE risk_score >= 0.8"
+    ).fetchone()[0]
+    active_tracks = conn.execute(
+        "SELECT COUNT(DISTINCT person_id) FROM alerts WHERE status NOT IN ('Resolved', 'Dismissed')"
+    ).fetchone()[0]
+    conn.close()
+
+    health = stream_manager.health()
+    fps = health.get("fps")
+    last_frame_age = None
+    if health.get("last_frame_ts"):
+        last_frame_age = round(time.time() - health["last_frame_ts"], 1)
+
+    return {
+        "total_alerts": total_alerts,
+        "total_incidents": total_incidents,
+        "active_incidents": active_incidents,
+        "high_risk_alerts": high_risk_alerts,
+        "active_tracks": active_tracks,
+        "pipeline_fps": round(fps, 1) if fps else None,
+        "pipeline_running": health.get("last_frame_ts") is not None,
+        "pipeline_frames": health.get("frames", 0),
+        "last_frame_age_s": last_frame_age,
+    }
+
+
+@router.get("/health")
+async def health_check():
+    """Unauthenticated liveness probe for load balancers and Docker healthcheck."""
+    return {"status": "ok"}
+
+
+@router.get("/system_status")
+async def system_status():
+    health = stream_manager.health()
+    now = time.time()
+    last_ts = health.get("last_frame_ts") or 0
+    pipeline_running = (now - last_ts) < 5
+
+    return {
+        "pipeline_running": bool(pipeline_running),
+        "camera_connected": bool(pipeline_running),
+        "fps": round(health.get("fps") or 0, 1),
+        "last_frame_ts": last_ts,
+    }
+
+
+@router.get("/system_metrics")
+async def system_metrics(_user: Optional[dict] = Depends(get_optional_user)):
+    """Extended system metrics including GPU info."""
+    health = stream_manager.health()
+    fps = health.get("fps")
+    last_frame_age = None
+    if health.get("last_frame_ts"):
+        last_frame_age = round(time.time() - health["last_frame_ts"], 1)
+
+    # GPU metrics
+    import torch
+    gpu_info = None
+    if torch.cuda.is_available():
+        try:
+            gpu_info = {
+                "name": torch.cuda.get_device_name(0),
+                "memory_allocated_mb": round(torch.cuda.memory_allocated(0) / 1024 / 1024, 1),
+                "memory_reserved_mb": round(torch.cuda.memory_reserved(0) / 1024 / 1024, 1),
+                "memory_total_mb": round(torch.cuda.get_device_properties(0).total_mem / 1024 / 1024, 1),
+                "utilization_percent": None,  # requires pynvml for real utilization
+            }
+        except Exception:
+            pass
+
+    return {
+        "pipeline_fps": round(fps, 1) if fps else None,
+        "pipeline_running": health.get("last_frame_ts") is not None,
+        "pipeline_frames": health.get("frames", 0),
+        "last_frame_age_s": last_frame_age,
+        "gpu_available": torch.cuda.is_available(),
+        "gpu_info": gpu_info,
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+    }
+
+
+def _parse_alert_ts(value: str) -> datetime | None:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_IST)
+    except Exception:
+        return None
+
+
+def _weapon_type_from_event(event_type: str | None) -> str | None:
+    event = (event_type or "").lower()
+    if "knife" in event:
+        return "knife"
+    if "gun" in event or "firearm" in event or "weapon" in event:
+        return "gun"
+    return None
+
+
+@router.get("/analytics")
+async def get_analytics(_user: dict = Depends(get_current_user)):
+    now = datetime.now(_IST)
+    hour_start = now.replace(minute=0, second=0, microsecond=0)
+    hour_buckets = [hour_start - timedelta(hours=23 - i) for i in range(24)]
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_buckets = [day_start - timedelta(days=6 - i) for i in range(7)]
+
+    conn = get_db_connection()
+    rows = conn.execute(
+        "SELECT event_type, risk_score, risk_level, timestamp, location FROM alerts"
+    ).fetchall()
+    total_incidents = conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0]
+    conn.close()
+
+    alerts_by_hour = {bucket.strftime("%Y-%m-%d %H:00"): 0 for bucket in hour_buckets}
+    alerts_by_day = {bucket.strftime("%Y-%m-%d"): 0 for bucket in day_buckets}
+    risk_distribution = {"low": 0, "medium": 0, "high": 0, "critical": 0}
+    weapon_types = {"gun": 0, "knife": 0}
+    locations: dict[str, int] = {}
+    risk_total = 0.0
+
+    for row in rows:
+        ts = _parse_alert_ts(row["timestamp"])
+        if ts is not None:
+            hour_key = ts.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:00")
+            if hour_key in alerts_by_hour:
+                alerts_by_hour[hour_key] += 1
+            day_key = ts.strftime("%Y-%m-%d")
+            if day_key in alerts_by_day:
+                alerts_by_day[day_key] += 1
+
+        risk_level = (row["risk_level"] or "low").lower()
+        if risk_level in risk_distribution:
+            risk_distribution[risk_level] += 1
+
+        weapon_type = _weapon_type_from_event(row["event_type"])
+        if weapon_type:
+            weapon_types[weapon_type] = weapon_types.get(weapon_type, 0) + 1
+
+        location = row["location"] or "Unknown"
+        locations[location] = locations.get(location, 0) + 1
+        risk_total += float(row["risk_score"] or 0)
+
+    total_alerts = len(rows)
+    top_locations = sorted(
+        [{"location": location, "count": count} for location, count in locations.items()],
+        key=lambda item: item["count"],
+        reverse=True,
+    )[:5]
+
+    return {
+        "alerts_by_hour": [
+            {"hour": bucket[-5:], "count": count}
+            for bucket, count in alerts_by_hour.items()
+        ],
+        "alerts_by_day": [
+            {"date": date, "count": count}
+            for date, count in alerts_by_day.items()
+        ],
+        "risk_distribution": risk_distribution,
+        "weapon_types": weapon_types,
+        "top_locations": top_locations,
+        "total_alerts": total_alerts,
+        "total_incidents": total_incidents,
+        "avg_risk_score": round(risk_total / total_alerts, 2) if total_alerts else 0.0,
+        "detection_rate_per_hour": round(sum(alerts_by_hour.values()) / 24.0, 2),
+    }
+
+
+class ZonePoint(BaseModel):
+    x: float = Field(ge=0.0, le=1.0)
+    y: float = Field(ge=0.0, le=1.0)
+
+
+class ZoneRequest(BaseModel):
+    points: list[ZonePoint] = Field(default_factory=list)
+
+
+@router.get("/detection_zone")
+async def get_detection_zone(_user: dict = Depends(get_current_user)):
+    return {"points": detection_zone.get()}
+
+
+@router.put("/detection_zone")
+async def update_detection_zone(
+    body: ZoneRequest,
+    _user: dict = Depends(require_roles("admin", "security", "operator")),
+):
+    try:
+        points = detection_zone.set([{"x": p.x, "y": p.y} for p in body.points])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"points": points}
+
+
+@router.delete("/detection_zone")
+async def clear_detection_zone(_user: dict = Depends(require_roles("admin", "security", "operator"))):
+    detection_zone.clear()
+    return {"points": []}
+
+
+@router.get("/model_performance")
+async def model_performance(_user: dict = Depends(get_current_user)):
+    plots = [
+        {
+            "filename": filename,
+            "title": title,
+            "url": f"/api/model_performance/{filename}",
+        }
+        for filename, title in EVAL_PLOTS.items()
+        if (EVAL_DIR / filename).is_file()
+    ]
+    return {"plots": plots}
+
+
+@router.get("/model_performance/{filename}")
+async def model_performance_plot(filename: str, request: Request):
+    token = _extract_token(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    verify_token(token)
+
+    if filename not in EVAL_PLOTS:
+        raise HTTPException(status_code=404, detail="Plot not found")
+    path = _safe_file_under(EVAL_DIR / filename, EVAL_DIR)
+    if not path:
+        raise HTTPException(status_code=404, detail="Plot not found")
+    return FileResponse(str(path), media_type="image/png")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXPORT
+# ══════════════════════════════════════════════════════════════════════════════
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+@router.get("/alerts/export/csv")
+async def export_alerts_csv(
+    limit: int = 1000,
+    _user: dict = Depends(get_current_user),
+):
+    """Download all alerts as a CSV file."""
+    import contextlib
+    with contextlib.closing(get_db_connection()) as conn:
+        rows = conn.execute(
+            "SELECT id, person_id, event_type, risk_score, risk_level, "
+            "timestamp, camera_id, location, status FROM alerts "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (min(limit, 10000),),
+        ).fetchall()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["id", "person_id", "event_type", "risk_score",
+                     "risk_level", "timestamp", "camera_id", "location", "status"])
+    for row in rows:
+        writer.writerow(list(row))
+
+    ts = datetime.now(_IST).strftime("%Y%m%d_%H%M%S")
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="alerts_{ts}.csv"'},
+    )
+
+
+@router.get("/incidents/export/csv")
+async def export_incidents_csv(
+    limit: int = 1000,
+    _user: dict = Depends(get_current_user),
+):
+    """Download all incidents as a CSV file."""
+    import contextlib
+    with contextlib.closing(get_db_connection()) as conn:
+        rows = conn.execute(
+            "SELECT id, title, description, event_type, location, "
+            "risk_level, status, created_at, resolved_at FROM incidents "
+            "ORDER BY created_at DESC LIMIT ?",
+            (min(limit, 10000),),
+        ).fetchall()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["id", "title", "description", "event_type",
+                     "location", "risk_level", "status", "created_at", "resolved_at"])
+    for row in rows:
+        writer.writerow(list(row))
+
+    ts = datetime.now(_IST).strftime("%Y%m%d_%H%M%S")
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="incidents_{ts}.csv"'},
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MULTI-CAMERA
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from backend.camera_registry import camera_registry
+    _MULTI_CAM = True
+except Exception:
+    camera_registry = None
+    _MULTI_CAM = False
+
+
+@router.get("/cameras")
+async def list_cameras(_user: dict = Depends(get_current_user)):
+    """List all registered cameras and their live health status."""
+    if not _MULTI_CAM or camera_registry is None:
+        return []
+    return camera_registry.list_cameras()
+
+
+@router.get("/cameras/{cam_id}/feed")
+async def camera_feed(cam_id: str, request: Request):
+    """MJPEG stream for a specific camera by ID."""
+    token = _extract_token(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    verify_token(token)
+
+    if not _MULTI_CAM or camera_registry is None:
+        raise HTTPException(status_code=503, detail="Multi-camera not configured")
+
+    async def generate():
+        while True:
+            if await request.is_disconnected():
+                break
+            frame_bytes = await asyncio.get_event_loop().run_in_executor(
+                None, camera_registry.get_frame, cam_id
+            )
+            if frame_bytes is None:
+                await asyncio.sleep(0.1)
+                continue
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
+            )
+            await asyncio.sleep(0.025)
+
+    return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VIDEO FEED
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/video_feed")
+async def video_feed(request: Request):
+    """MJPEG video stream. Requires a valid JWT token."""
+    token = _extract_token(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required for video feed")
+    verify_token(token)  # raises 401 if invalid or expired
+
+    async def generate():
+        while True:
+            if await request.is_disconnected():
+                break
+            # get_frame_bytes() returns pre-encoded bytes (no blocking encode here)
+            frame_bytes = await asyncio.get_event_loop().run_in_executor(
+                None, stream_manager.get_frame_bytes
+            )
+            if frame_bytes is None:
+                await asyncio.sleep(0.05)
+                continue
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
+            )
+            await asyncio.sleep(0.025)  # ~40 FPS cap
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@router.get("/frame")
+async def single_frame(request: Request):
+    """Return the latest frame as a single JPEG."""
+    token = _extract_token(request)
+    if token:
+        verify_token(token)
+
+    frame_bytes = stream_manager.get_frame_bytes()
+    if frame_bytes is None:
+        raise HTTPException(status_code=503, detail="No frame available")
+    return Response(content=frame_bytes, media_type="image/jpeg")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# USER MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/users")
+async def get_users(user: dict = Depends(require_roles("admin"))):
+    conn = get_db_connection()
+    users = conn.execute(
+        "SELECT id, username, role, status, last_active FROM users ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in users]
+
+
+class CreateUserRequest(BaseModel):
+    username: str
+    password: str
+    role: str = "viewer"
+
+
+@router.post("/users", status_code=201)
+async def create_user(
+    body: CreateUserRequest,
+    user: dict = Depends(require_roles("admin")),
+):
+    if body.role not in ("admin", "operator", "viewer", "security"):
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    conn = get_db_connection()
+    existing = conn.execute("SELECT id FROM users WHERE username = ?", (body.username,)).fetchone()
     if existing:
         conn.close()
-        return jsonify({'error': 'Username already exists'}), 409
-    
+        raise HTTPException(status_code=409, detail="Username already exists")
+
     try:
         cursor = conn.cursor()
         cursor.execute(
-            'INSERT INTO users (username, password_hash, role, status, last_active) VALUES (?, ?, ?, ?, ?)',
-            (username, generate_password_hash(password), role, 'Active', 'Just now')
+            "INSERT INTO users (username, password_hash, role, status, last_active) VALUES (?, ?, ?, ?, ?)",
+            (body.username, generate_password_hash(body.password), body.role, "Active", "Just now"),
         )
         conn.commit()
         user_id = cursor.lastrowid
+    finally:
         conn.close()
-        return jsonify({'message': 'User created', 'id': user_id}), 201
-    except Exception as e:
-        conn.close()
-        current_app.logger.exception("Failed to create user")
-        return jsonify({'error': 'Internal server error'}), 500
+
+    return {"message": "User created", "id": user_id}
 
 
-@api_bp.route('/users/<int:user_id>', methods=['PUT'])
-@token_required(roles=['admin'])
-def update_user(user_id):
-    """Update an existing user."""
-    from werkzeug.security import generate_password_hash
-    
-    data = request.get_json()
-    if not data:
-        return jsonify({'error': 'Missing request body'}), 400
-    
+class UpdateUserRequest(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+    role: Optional[str] = None
+    status: Optional[str] = None
+
+
+@router.put("/users/{user_id}")
+async def update_user(
+    user_id: int,
+    body: UpdateUserRequest,
+    user: dict = Depends(require_roles("admin")),
+):
     conn = get_db_connection()
-    
-    # Check if user exists
-    existing = conn.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
+    existing = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     if not existing:
         conn.close()
-        return jsonify({'error': 'User not found'}), 404
-    
-    # Build update query dynamically
+        raise HTTPException(status_code=404, detail="User not found")
+
     updates = []
     values = []
-    
-    if 'username' in data:
-        # Check if new username is taken by another user
-        other = conn.execute('SELECT id FROM users WHERE username = ? AND id != ?', (data['username'], user_id)).fetchone()
+
+    if body.username is not None:
+        other = conn.execute(
+            "SELECT id FROM users WHERE username = ? AND id != ?", (body.username, user_id)
+        ).fetchone()
         if other:
             conn.close()
-            return jsonify({'error': 'Username already taken'}), 409
-        updates.append('username = ?')
-        values.append(data['username'])
-    
-    if 'password' in data and data['password']:
-        updates.append('password_hash = ?')
-        values.append(generate_password_hash(data['password']))
-    
-    if 'role' in data:
-        if data['role'] not in ['admin', 'operator', 'viewer', 'security']:
+            raise HTTPException(status_code=409, detail="Username already taken")
+        updates.append("username = ?")
+        values.append(body.username)
+
+    if body.password:
+        updates.append("password_hash = ?")
+        values.append(generate_password_hash(body.password))
+
+    if body.role is not None:
+        if body.role not in ("admin", "operator", "viewer", "security"):
             conn.close()
-            return jsonify({'error': 'Invalid role'}), 400
-        updates.append('role = ?')
-        values.append(data['role'])
-    
-    if 'status' in data:
-        allowed_statuses = {'active', 'inactive', 'suspended'}
-        status_val = str(data['status']).strip().lower()
-        if status_val not in allowed_statuses:
+            raise HTTPException(status_code=400, detail="Invalid role")
+        updates.append("role = ?")
+        values.append(body.role)
+
+    if body.status is not None:
+        allowed = {"active", "inactive", "suspended"}
+        if body.status.strip().lower() not in allowed:
             conn.close()
-            return jsonify({'error': f'Invalid status. Must be one of: {", ".join(allowed_statuses)}'}), 400
-        updates.append('status = ?')
-        values.append(data['status'].strip().title())  # Normalize to Title Case
-    
+            raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(allowed)}")
+        updates.append("status = ?")
+        values.append(body.status.strip().title())
+
     if not updates:
         conn.close()
-        return jsonify({'error': 'No fields to update'}), 400
-    
+        raise HTTPException(status_code=400, detail="No fields to update")
+
     values.append(user_id)
     query = f"UPDATE users SET {', '.join(updates)} WHERE id = ?"
-    
-    try:
-        conn.execute(query, values)
-        conn.commit()
-        conn.close()
-        return jsonify({'message': 'User updated', 'id': user_id}), 200
-    except Exception as e:
-        conn.close()
-        current_app.logger.exception("Failed to update user")
-        return jsonify({'error': 'Internal server error'}), 500
-
-
-@api_bp.route('/users/<int:user_id>', methods=['DELETE'])
-@token_required(roles=['admin'])
-def delete_user(user_id):
-    """Deactivate a user (soft delete)."""
-    conn = get_db_connection()
-    
-    # Check if user exists
-    existing = conn.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
-    if not existing:
-        conn.close()
-        return jsonify({'error': 'User not found'}), 404
-    
-    # Soft delete - set status to Inactive
-    conn.execute('UPDATE users SET status = ? WHERE id = ?', ('Inactive', user_id))
+    conn.execute(query, values)
     conn.commit()
     conn.close()
-    
-    return jsonify({'message': 'User deactivated', 'id': user_id}), 200
+
+    return {"message": "User updated", "id": user_id}
+
+
+@router.delete("/users/{user_id}")
+async def delete_user(
+    user_id: int,
+    user: dict = Depends(require_roles("admin")),
+):
+    conn = get_db_connection()
+    existing = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+
+    conn.execute("UPDATE users SET status = ? WHERE id = ?", ("Inactive", user_id))
+    conn.commit()
+    conn.close()
+
+    return {"message": "User deactivated", "id": user_id}

@@ -1,9 +1,10 @@
 "use client";
 
-import { useState, useEffect, useCallback } from 'react';
-import { Search, Filter, Eye, Check, AlertTriangle, X, ArrowUp } from 'lucide-react';
-import { useSearchParams } from 'next/navigation';
-import { getIncidents, resolveIncident, escalateIncident } from '@/lib/api';
+import { useCallback, useEffect, useRef, useState } from "react";
+import { AlertTriangle, ArrowUp, Check, Download, Eye, Filter, Search, X } from "lucide-react";
+import { useSearchParams } from "next/navigation";
+import { escalateIncident, getApiToken, getIncidentClipUrl, getIncidents, resolveIncident } from "@/lib/api";
+import { useWebSocket, WSMessage } from "@/lib/socket";
 
 interface Incident {
   id: number;
@@ -15,55 +16,60 @@ interface Incident {
   status: string;
   created_at: string;
   resolved_at: string | null;
+  clip_path: string | null;
+  person_id: string | null;
 }
 
-function getRiskColor(risk: string) {
-  const normalizedRisk = (risk || '').toLowerCase();
-  switch (normalizedRisk) {
-    case 'high':
-    case 'critical':
-      return 'border-red-500 text-red-500 bg-red-500/10 shadow-[0_0_8px_rgba(239,68,68,0.4)]';
-    case 'medium':
-    case 'suspicious':
-      return 'border-yellow-500 text-yellow-500 bg-yellow-500/10 shadow-[0_0_8px_rgba(234,179,8,0.3)]';
-    case 'low':
-      return 'border-[#22c55e] text-[#22c55e] bg-[#22c55e]/10 shadow-[0_0_8px_rgba(34,197,94,0.3)]';
-    default:
-      return 'border-[#00e5ff] text-[#00e5ff] bg-[#00e5ff]/10 shadow-[0_0_8px_rgba(0,229,255,0.3)]';
-  }
+function getRiskBadgeClass(risk: string) {
+  const r = (risk || "").toLowerCase();
+  if (r === "high" || r === "critical") return "badge badge-critical";
+  if (r === "medium" || r === "suspicious") return "badge badge-medium";
+  if (r === "low") return "badge badge-low";
+  return "badge badge-low";
 }
 
-function getStatusColor(status: string) {
-  const normalizedStatus = (status || '').toLowerCase();
-  switch (normalizedStatus) {
-    case 'resolved':
-      return 'border-[#22c55e] text-[#22c55e] bg-[#22c55e]/10 shadow-[0_0_8px_rgba(34,197,94,0.3)]';
-    case 'under review':
-      return 'border-[#00e5ff] text-[#00e5ff] bg-[#00e5ff]/10 shadow-[0_0_8px_rgba(0,229,255,0.3)]';
-    case 'escalated':
-      return 'border-red-500 text-red-500 bg-red-500/10 shadow-[0_0_8px_rgba(239,68,68,0.4)]';
-    case 'false alarm':
-      return 'border-zinc-500 text-zinc-500 bg-zinc-500/10';
-    case 'open':
-      return 'border-yellow-500 text-yellow-500 bg-yellow-500/10 shadow-[0_0_8px_rgba(234,179,8,0.3)]';
-    default:
-      return 'border-zinc-500 text-zinc-500 bg-zinc-500/10';
-  }
+function getStatusBadgeClass(status: string) {
+  const s = (status || "").toLowerCase();
+  if (s === "resolved") return "badge badge-low";
+  if (s === "under review") return "badge badge-medium";
+  if (s === "escalated") return "badge badge-critical";
+  if (s === "false alarm") return "badge";
+  if (s === "open") return "badge badge-medium";
+  return "badge";
+}
+
+function incidentFromMessage(data: Record<string, unknown>): Incident | null {
+  if (typeof data.id !== "number") return null;
+  return {
+    id: data.id,
+    title: typeof data.title === "string" ? data.title : "Incident",
+    description: typeof data.description === "string" ? data.description : "",
+    event_type: typeof data.event_type === "string" ? data.event_type : "Incident",
+    location: typeof data.location === "string" ? data.location : "Main Entrance",
+    risk_level: typeof data.risk_level === "string" ? data.risk_level : "low",
+    status: typeof data.status === "string" ? data.status : "Open",
+    created_at: typeof data.created_at === "string" ? data.created_at : "",
+    resolved_at: typeof data.resolved_at === "string" ? data.resolved_at : null,
+    clip_path: typeof data.clip_path === "string" ? data.clip_path : null,
+    person_id: typeof data.person_id === "string" ? data.person_id : null,
+  };
 }
 
 export default function IncidentHistory() {
   const searchParams = useSearchParams();
-  const initialSearch = searchParams.get('search') || '';
-  
+  const initialSearch = searchParams.get("search") || "";
+  const modalRef = useRef<HTMLDivElement | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState(initialSearch);
-  const [riskFilter, setRiskFilter] = useState('all');
-  const [statusFilter, setStatusFilter] = useState('all-status');
+  const [riskFilter, setRiskFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all-status");
   const [actionLoading, setActionLoading] = useState<number | null>(null);
   const [selectedIncident, setSelectedIncident] = useState<Incident | null>(null);
-  const [showModal, setShowModal] = useState(false);
+  const [clipError, setClipError] = useState(false);
 
   const fetchIncidents = useCallback(async () => {
     try {
@@ -71,8 +77,8 @@ export default function IncidentHistory() {
       setIncidents(Array.isArray(data) ? data : []);
       setError(null);
     } catch (err) {
-      console.error('Failed to fetch incidents', err);
-      setError('Failed to connect to backend');
+      console.error("Failed to fetch incidents", err);
+      setError("Failed to connect to backend");
     } finally {
       setLoading(false);
     }
@@ -80,17 +86,55 @@ export default function IncidentHistory() {
 
   useEffect(() => {
     fetchIncidents();
-    const interval = setInterval(fetchIncidents, 10000);
-    return () => clearInterval(interval);
   }, [fetchIncidents]);
 
-  // Update search when URL param changes
-  useEffect(() => {
-    const urlSearch = searchParams.get('search');
-    if (urlSearch) {
-      setSearchQuery(urlSearch);
+  const handleWSMessage = useCallback((msg: WSMessage) => {
+    if (msg.type === "new_incident" && msg.data) {
+      const incident = incidentFromMessage(msg.data);
+      if (incident) setIncidents((prev) => [incident, ...prev]);
     }
+  }, []);
+
+  useWebSocket(handleWSMessage);
+
+  useEffect(() => {
+    const urlSearch = searchParams.get("search");
+    if (urlSearch) setSearchQuery(urlSearch);
   }, [searchParams]);
+
+  useEffect(() => {
+    if (!selectedIncident) return;
+
+    closeButtonRef.current?.focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closeModal();
+        return;
+      }
+      if (event.key !== "Tab" || !modalRef.current) return;
+
+      const focusable = Array.from(
+        modalRef.current.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), video, [tabindex]:not([tabindex="-1"])'
+        )
+      );
+      if (focusable.length === 0) return;
+
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [selectedIncident]);
 
   const handleResolve = async (incidentId: number) => {
     setActionLoading(incidentId);
@@ -99,11 +143,11 @@ export default function IncidentHistory() {
       await fetchIncidents();
       setError(null);
       if (selectedIncident?.id === incidentId) {
-        setSelectedIncident(prev => prev ? { ...prev, status: 'Resolved' } : null);
+        setSelectedIncident((prev) => prev ? { ...prev, status: "Resolved" } : null);
       }
     } catch (err) {
-      console.error('Failed to resolve incident:', err);
-      setError(err instanceof Error ? err.message : 'Failed to resolve incident');
+      console.error("Failed to resolve incident:", err);
+      setError(err instanceof Error ? err.message : "Failed to resolve incident");
     } finally {
       setActionLoading(null);
     }
@@ -116,186 +160,177 @@ export default function IncidentHistory() {
       await fetchIncidents();
       setError(null);
       if (selectedIncident?.id === incidentId) {
-        setSelectedIncident(prev => prev ? { ...prev, status: 'Escalated' } : null);
+        setSelectedIncident((prev) => prev ? { ...prev, status: "Escalated" } : null);
       }
     } catch (err) {
-      console.error('Failed to escalate incident:', err);
-      setError(err instanceof Error ? err.message : 'Failed to escalate incident');
+      console.error("Failed to escalate incident:", err);
+      setError(err instanceof Error ? err.message : "Failed to escalate incident");
     } finally {
       setActionLoading(null);
     }
   };
 
-  const handleView = (incident: Incident) => {
+  const openModal = (incident: Incident) => {
     setSelectedIncident(incident);
-    setShowModal(true);
+    setClipError(false);
   };
 
-  const closeModal = () => {
-    setShowModal(false);
+  function closeModal() {
     setSelectedIncident(null);
-  };
+    setClipError(false);
+  }
 
   const filtered = incidents.filter((inc) => {
+    const search = searchQuery.toLowerCase();
     const matchSearch =
-      !searchQuery ||
-      inc.title?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      inc.event_type?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      inc.description?.toLowerCase().includes(searchQuery.toLowerCase());
-    const matchRisk = riskFilter === 'all' || inc.risk_level?.toLowerCase() === riskFilter;
+      !search ||
+      inc.title?.toLowerCase().includes(search) ||
+      inc.event_type?.toLowerCase().includes(search) ||
+      inc.description?.toLowerCase().includes(search);
+    const matchRisk = riskFilter === "all" || inc.risk_level?.toLowerCase() === riskFilter;
     const matchStatus =
-      statusFilter === 'all-status' ||
-      inc.status?.toLowerCase().replace(/\s+/g, '-') === statusFilter;
+      statusFilter === "all-status" ||
+      inc.status?.toLowerCase().replace(/\s+/g, "-") === statusFilter;
     return matchSearch && matchRisk && matchStatus;
   });
 
   return (
-    <div className="flex-1 bg-[#0a0a0c] overflow-auto">
+    <div className="flex-1 overflow-auto" style={{ background: "var(--bg-primary)" }}>
       <div className="p-6">
         <div className="mb-6">
-          <h1 className="text-[#00e5ff] text-xl font-mono font-bold tracking-widest uppercase flex items-center gap-2">📋 INCIDENT LOG</h1>
-          <p className="text-zinc-500 text-sm font-mono mt-1">{'// Review and analyze detection events'}</p>
+          <h1 className="text-lg font-semibold" style={{ color: "var(--text-primary)" }}>Incident History</h1>
+          <p className="text-sm mt-1" style={{ color: "var(--text-muted)" }}>Review and analyze detection events</p>
         </div>
 
-        {/* Error Banner */}
         {error && (
-          <div className="mb-4 bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-4 backdrop-blur-md">
+          <div className="mb-4 p-4 rounded-lg" style={{ background: "var(--warning-dim)", border: "1px solid rgba(245,158,11,0.3)" }}>
             <div className="flex items-center gap-3">
-              <AlertTriangle className="w-5 h-5 text-yellow-500 flex-shrink-0" />
-              <p className="text-yellow-400 text-sm font-mono">⚠️ {error}</p>
+              <AlertTriangle className="w-4 h-4 flex-shrink-0" style={{ color: "var(--warning)" }} />
+              <p className="text-sm" style={{ color: "var(--warning)" }}>{error}</p>
             </div>
           </div>
         )}
 
-        <div className="bg-black/40 backdrop-blur-md border border-[#00e5ff]/20 rounded-lg overflow-hidden">
-          <div className="border-b border-[#00e5ff]/20 p-4">
-            <h2 className="text-[#00e5ff] font-mono text-xs uppercase tracking-widest">📊 EVENT DATABASE</h2>
+        <div className="panel">
+          <div className="panel-header">
+            <span className="panel-title">Incident Log</span>
+            <a
+              href={`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api"}/incidents/export/csv${getApiToken() ? `?token=${encodeURIComponent(getApiToken()!)}` : ""}`}
+              download
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs transition-colors"
+              style={{ background: "var(--accent-dim)", border: "1px solid rgba(59,130,246,0.2)", color: "var(--accent)" }}
+            >
+              <Download className="w-3 h-3" />
+              Export CSV
+            </a>
           </div>
           <div className="p-4">
             <div className="flex flex-wrap items-center gap-3 mb-4">
               <div className="relative flex-1 min-w-[200px]">
-                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-[#00e5ff]/50" />
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4" style={{ color: "var(--text-dim)" }} />
                 <input
                   aria-label="Search incidents"
-                  placeholder="🔍 SEARCH DATABANKS..."
+                  placeholder="Search incidents..."
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  className="pl-10 pr-4 py-2.5 bg-black/60 border border-[#00e5ff]/30 text-zinc-300 placeholder:text-zinc-600 text-sm w-full rounded-md focus:outline-none focus:border-[#00e5ff] focus:shadow-[0_0_15px_rgba(0,229,255,0.15)] font-mono transition-all"
+                  className="pl-10 pr-4 py-2.5 w-full rounded-md text-sm focus:outline-none transition-colors"
+                  style={{ background: "var(--bg-primary)", border: "1px solid var(--border-strong)", color: "var(--text-primary)" }}
                 />
               </div>
               <div className="relative">
-                <Filter className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-[#00e5ff]/50" />
+                <Filter className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4" style={{ color: "var(--text-dim)" }} />
                 <select
                   aria-label="Filter by risk level"
                   value={riskFilter}
                   onChange={(e) => setRiskFilter(e.target.value)}
-                  className="w-44 pl-10 pr-4 py-2.5 bg-black/60 border border-[#00e5ff]/30 text-zinc-300 text-xs rounded-md focus:outline-none focus:border-[#00e5ff] font-mono transition-all appearance-none cursor-pointer"
+                  className="w-44 pl-10 pr-4 py-2.5 rounded-md text-xs focus:outline-none transition-colors appearance-none cursor-pointer"
+                  style={{ background: "var(--bg-primary)", border: "1px solid var(--border-strong)", color: "var(--text-secondary)" }}
                 >
-                  <option value="all">ALL RISK LEVELS</option>
-                  <option value="high">⚠️ HIGH</option>
-                  <option value="medium">🔶 MEDIUM</option>
-                  <option value="low">🟢 LOW</option>
+                  <option value="all">All Risk Levels</option>
+                  <option value="critical">Critical</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
                 </select>
               </div>
               <select
                 aria-label="Filter by status"
                 value={statusFilter}
                 onChange={(e) => setStatusFilter(e.target.value)}
-                className="w-44 px-4 py-2.5 bg-black/60 border border-[#00e5ff]/30 text-zinc-300 text-xs rounded-md focus:outline-none focus:border-[#00e5ff] font-mono transition-all appearance-none cursor-pointer"
+                className="w-44 px-4 py-2.5 rounded-md text-xs focus:outline-none transition-colors appearance-none cursor-pointer"
+                style={{ background: "var(--bg-primary)", border: "1px solid var(--border-strong)", color: "var(--text-secondary)" }}
               >
-                <option value="all-status">ALL STATUS</option>
-                <option value="open">● OPEN</option>
-                <option value="resolved">✓ RESOLVED</option>
-                <option value="under-review">👁️ UNDER REVIEW</option>
-                <option value="escalated">🚨 ESCALATED</option>
-                <option value="false-alarm">❌ FALSE ALARM</option>
+                <option value="all-status">All Status</option>
+                <option value="open">Open</option>
+                <option value="resolved">Resolved</option>
+                <option value="under-review">Under Review</option>
+                <option value="escalated">Escalated</option>
+                <option value="false-alarm">False Alarm</option>
               </select>
             </div>
 
             {loading ? (
               <div className="space-y-2">
-                {[1,2,3,4,5].map(i => (
-                  <div key={i} className="animate-pulse flex items-center gap-4 p-3 bg-black/40 border border-[#00e5ff]/10 rounded">
-                    <div className="h-4 bg-zinc-800 rounded w-24"></div>
-                    <div className="h-4 bg-zinc-800 rounded w-32"></div>
-                    <div className="h-4 bg-zinc-800 rounded w-20"></div>
-                    <div className="h-4 bg-zinc-800 rounded w-16"></div>
-                    <div className="h-4 bg-zinc-800 rounded w-16"></div>
+                {[1, 2, 3, 4, 5].map((i) => (
+                  <div key={i} className="animate-pulse flex items-center gap-4 p-3 rounded" style={{ background: "var(--bg-primary)", border: "1px solid var(--border)" }}>
+                    <div className="h-4 rounded w-24" style={{ background: "var(--bg-elevated)" }} />
+                    <div className="h-4 rounded w-32" style={{ background: "var(--bg-elevated)" }} />
+                    <div className="h-4 rounded w-20" style={{ background: "var(--bg-elevated)" }} />
+                    <div className="h-4 rounded w-16" style={{ background: "var(--bg-elevated)" }} />
+                    <div className="h-4 rounded w-16" style={{ background: "var(--bg-elevated)" }} />
                   </div>
                 ))}
               </div>
             ) : (
-              <div className="border border-[#00e5ff]/20 rounded-md overflow-x-auto">
+              <div className="rounded-md overflow-x-auto" style={{ border: "1px solid var(--border)" }}>
                 <table className="w-full text-left border-collapse min-w-[900px]">
                   <thead>
-                    <tr className="border-b border-[#00e5ff]/20">
-                      <th className="p-4 text-[#00e5ff]/70 text-[10px] font-mono font-medium uppercase tracking-widest">TIMESTAMP</th>
-                      <th className="p-4 text-[#00e5ff]/70 text-[10px] font-mono font-medium uppercase tracking-widest">EVENT TYPE</th>
-                      <th className="p-4 text-[#00e5ff]/70 text-[10px] font-mono font-medium uppercase tracking-widest">LOCATION</th>
-                      <th className="p-4 text-[#00e5ff]/70 text-[10px] font-mono font-medium uppercase tracking-widest">RISK LEVEL</th>
-                      <th className="p-4 text-[#00e5ff]/70 text-[10px] font-mono font-medium uppercase tracking-widest">STATUS</th>
-                      <th className="p-4 text-[#00e5ff]/70 text-[10px] font-mono font-medium uppercase tracking-widest">ACTIONS</th>
+                    <tr style={{ borderBottom: "1px solid var(--border)" }}>
+                      <th className="p-4 table-header">Timestamp</th>
+                      <th className="p-4 table-header">Event Type</th>
+                      <th className="p-4 table-header">Location</th>
+                      <th className="p-4 table-header">Risk Level</th>
+                      <th className="p-4 table-header">Status</th>
+                      <th className="p-4 table-header">Actions</th>
                     </tr>
                   </thead>
                   <tbody>
                     {filtered.map((incident) => {
-                      const isResolved = incident.status?.toLowerCase() === 'resolved';
-                      const isEscalated = incident.status?.toLowerCase() === 'escalated';
-                      
+                      const isResolved = incident.status?.toLowerCase() === "resolved";
+                      const isEscalated = incident.status?.toLowerCase() === "escalated";
                       return (
-                        <tr
-                          key={incident.id}
-                          className="border-b border-[#00e5ff]/10 hover:bg-[#00e5ff]/5 transition-colors last:border-0"
-                        >
-                          <td className="p-4 text-zinc-400 text-xs font-mono">
-                            {incident.created_at}
-                          </td>
-                          <td className="p-4 text-zinc-300 text-xs font-mono">
-                            {incident.event_type || incident.title}
-                          </td>
-                          <td className="p-4 text-zinc-400 text-xs font-mono">
-                            {incident.location}
-                          </td>
+                        <tr key={incident.id} className="transition-colors last:border-0" style={{ borderBottom: "1px solid var(--border)" }}>
+                          <td className="p-4 text-xs font-mono" style={{ color: "var(--text-muted)" }}>{incident.created_at}</td>
+                          <td className="p-4 text-xs" style={{ color: "var(--text-primary)" }}>{incident.event_type || incident.title}</td>
+                          <td className="p-4 text-xs" style={{ color: "var(--text-muted)" }}>{incident.location}</td>
+                          <td className="p-4"><span className={getRiskBadgeClass(incident.risk_level)}>{incident.risk_level?.toUpperCase()}</span></td>
+                          <td className="p-4"><span className={getStatusBadgeClass(incident.status)}>{incident.status}</span></td>
                           <td className="p-4">
-                            <div className={`inline-block px-2 py-0.5 border rounded text-[10px] font-mono uppercase ${getRiskColor(incident.risk_level)}`}>
-                              {incident.risk_level?.toUpperCase()}
-                            </div>
-                          </td>
-                          <td className="p-4">
-                            <div className={`inline-block px-2 py-0.5 border rounded text-[10px] font-mono uppercase ${getStatusColor(incident.status)}`}>
-                              {incident.status}
-                            </div>
-                          </td>
-                          <td className="p-4">
-                            <div className="flex items-center gap-2">
-                              <button
-                                onClick={() => handleView(incident)}
-                                className="px-2 py-1 bg-transparent border border-[#00e5ff]/50 text-[#00e5ff] hover:bg-[#00e5ff]/20 hover:shadow-[0_0_10px_rgba(0,229,255,0.2)] rounded font-mono text-[10px] uppercase tracking-wider transition-all flex items-center gap-1"
-                                title="View details"
-                              >
+                            <div className="flex flex-wrap items-center gap-2">
+                              <button onClick={() => openModal(incident)} className="btn btn-ghost" title="View details">
                                 <Eye className="w-3 h-3" />
-                                👁️ VIEW
+                                View
                               </button>
-                              {!isResolved && (
+                              {incident.clip_path && (
                                 <button
-                                  onClick={() => handleResolve(incident.id)}
-                                  disabled={actionLoading === incident.id}
-                                  className="px-2 py-1 bg-transparent border border-[#22c55e]/50 text-[#22c55e] hover:bg-[#22c55e]/20 hover:shadow-[0_0_10px_rgba(34,197,94,0.2)] rounded font-mono text-[10px] uppercase tracking-wider transition-all flex items-center gap-1 disabled:opacity-50"
-                                  title="Resolve incident"
+                                  onClick={() => openModal(incident)}
+                                  className="btn"
+                                  style={{ color: "var(--accent)", borderColor: "rgba(59,130,246,0.28)", background: "var(--accent-dim)" }}
+                                  title="View incident clip"
                                 >
+                                  ▶ View Clip
+                                </button>
+                              )}
+                              {!isResolved && (
+                                <button onClick={() => handleResolve(incident.id)} disabled={actionLoading === incident.id} className="btn btn-success" title="Resolve incident">
                                   <Check className="w-3 h-3" />
-                                  {actionLoading === incident.id ? '...' : '✅ RESOLVE'}
+                                  {actionLoading === incident.id ? "..." : "Resolve"}
                                 </button>
                               )}
                               {!isResolved && !isEscalated && (
-                                <button
-                                  onClick={() => handleEscalate(incident.id)}
-                                  disabled={actionLoading === incident.id}
-                                  className="px-2 py-1 bg-transparent border border-red-500/50 text-red-500 hover:bg-red-500/20 hover:shadow-[0_0_10px_rgba(239,68,68,0.2)] rounded font-mono text-[10px] uppercase tracking-wider transition-all flex items-center gap-1 disabled:opacity-50"
-                                  title="Escalate incident"
-                                >
+                                <button onClick={() => handleEscalate(incident.id)} disabled={actionLoading === incident.id} className="btn btn-danger" title="Escalate incident">
                                   <ArrowUp className="w-3 h-3" />
-                                  {actionLoading === incident.id ? '...' : '🚨 ESCALATE'}
+                                  {actionLoading === incident.id ? "..." : "Escalate"}
                                 </button>
                               )}
                             </div>
@@ -305,9 +340,7 @@ export default function IncidentHistory() {
                     })}
                     {filtered.length === 0 && (
                       <tr>
-                        <td colSpan={6} className="p-8 text-center text-zinc-600 text-xs font-mono">
-                          {'// NO INCIDENTS MATCHING CRITERIA'}
-                        </td>
+                        <td colSpan={6} className="p-8 text-center text-sm" style={{ color: "var(--text-muted)" }}>No incidents matching criteria</td>
                       </tr>
                     )}
                   </tbody>
@@ -318,88 +351,59 @@ export default function IncidentHistory() {
         </div>
       </div>
 
-      {/* Incident Detail Modal */}
-      {showModal && selectedIncident && (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="bg-[#0a0a0c] border border-[#00e5ff]/30 rounded-lg max-w-lg w-full max-h-[90vh] overflow-y-auto shadow-[0_0_30px_rgba(0,229,255,0.2)]">
-            <div className="flex items-center justify-between p-4 border-b border-[#00e5ff]/20">
-              <h2 className="text-[#00e5ff] font-mono text-sm uppercase tracking-widest">📋 INCIDENT DETAILS</h2>
-              <button
-                onClick={closeModal}
-                className="text-zinc-500 hover:text-[#00e5ff] transition-colors"
-              >
-                <X className="w-5 h-5" />
+      {selectedIncident && (
+        <div className="fixed inset-0 flex items-center justify-center z-50 p-4" style={{ background: "rgba(0,0,0,0.76)", backdropFilter: "blur(4px)" }}>
+          <div
+            ref={modalRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="incident-dialog-title"
+            className="max-w-4xl w-full max-h-[92vh] overflow-y-auto rounded-lg"
+            style={{ background: "var(--bg-panel)", border: "1px solid var(--border-strong)" }}
+          >
+            <div className="flex items-center justify-between p-4" style={{ borderBottom: "1px solid var(--border)" }}>
+              <div className="flex items-center gap-3 min-w-0">
+                <h2 id="incident-dialog-title" className="text-sm font-semibold truncate" style={{ color: "var(--text-primary)" }}>{selectedIncident.title}</h2>
+                <span className={getRiskBadgeClass(selectedIncident.risk_level)}>{selectedIncident.risk_level?.toUpperCase()}</span>
+              </div>
+              <button ref={closeButtonRef} onClick={closeModal} className="btn btn-ghost" aria-label="Close incident clip">
+                ×
               </button>
             </div>
+
             <div className="p-4 space-y-4">
-              <div>
-                <label className="text-[#00e5ff]/60 text-[10px] font-mono uppercase tracking-wider block mb-1">EVENT TYPE</label>
-                <p className="text-zinc-300 font-mono">{selectedIncident.event_type || selectedIncident.title}</p>
-              </div>
-              <div>
-                <label className="text-[#00e5ff]/60 text-[10px] font-mono uppercase tracking-wider block mb-1">DESCRIPTION</label>
-                <p className="text-zinc-400 text-sm">{selectedIncident.description || 'No description available'}</p>
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="text-zinc-500 text-xs font-mono block mb-1">Location</label>
-                  <p className="text-white text-sm">{selectedIncident.location}</p>
-                </div>
-                <div>
-                  <label className="text-zinc-500 text-xs font-mono block mb-1">Created At</label>
-                  <p className="text-white text-sm">{selectedIncident.created_at}</p>
-                </div>
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="text-zinc-500 text-xs font-mono block mb-1">Risk Level</label>
-                  <div className={`inline-block px-2 py-0.5 border rounded text-xs font-mono ${getRiskColor(selectedIncident.risk_level)}`}>
-                    {selectedIncident.risk_level?.toUpperCase()}
-                  </div>
-                </div>
-                <div>
-                  <label className="text-zinc-500 text-xs font-mono block mb-1">Status</label>
-                  <div className={`inline-block px-2 py-0.5 border rounded text-xs font-mono ${getStatusColor(selectedIncident.status)}`}>
-                    {selectedIncident.status}
-                  </div>
-                </div>
-              </div>
-              {selectedIncident.resolved_at && (
-                <div>
-                  <label className="text-[#00e5ff]/60 text-[10px] font-mono uppercase tracking-wider block mb-1">RESOLVED AT</label>
-                  <p className="text-green-400 text-sm font-mono">{selectedIncident.resolved_at}</p>
+              {!clipError && selectedIncident.clip_path ? (
+                <video
+                  key={selectedIncident.id}
+                  controls
+                  autoPlay
+                  preload="metadata"
+                  className="w-full rounded-md"
+                  style={{ background: "var(--bg-primary)", border: "1px solid var(--border)" }}
+                  src={getIncidentClipUrl(selectedIncident.id)}
+                  onError={() => setClipError(true)}
+                />
+              ) : (
+                <div className="rounded-md p-6 text-sm text-center" style={{ background: "var(--bg-primary)", border: "1px solid var(--border)", color: "var(--text-muted)" }}>
+                  Clip not available
                 </div>
               )}
-            </div>
-            <div className="flex items-center gap-2 p-4 border-t border-[#00e5ff]/20">
-              {selectedIncident.status?.toLowerCase() !== 'resolved' && (
-                <>
-                  <button
-                    onClick={() => handleResolve(selectedIncident.id)}
-                    disabled={actionLoading === selectedIncident.id}
-                    className="flex items-center gap-1.5 bg-transparent border border-green-500/50 text-green-400 hover:bg-green-500/20 hover:shadow-[0_0_10px_rgba(34,197,94,0.2)] font-mono text-[10px] uppercase tracking-wider px-3 h-8 rounded transition-all disabled:opacity-50"
-                  >
-                    <Check className="w-3 h-3" />
-                    {actionLoading === selectedIncident.id ? '...' : '✅ RESOLVE'}
-                  </button>
-                  {selectedIncident.status?.toLowerCase() !== 'escalated' && (
-                    <button
-                      onClick={() => handleEscalate(selectedIncident.id)}
-                      disabled={actionLoading === selectedIncident.id}
-                      className="flex items-center gap-1.5 bg-transparent border border-red-500/50 text-red-400 hover:bg-red-500/20 hover:shadow-[0_0_10px_rgba(239,68,68,0.2)] font-mono text-[10px] uppercase tracking-wider px-3 h-8 rounded transition-all disabled:opacity-50"
-                    >
-                      <ArrowUp className="w-3 h-3" />
-                      {actionLoading === selectedIncident.id ? '...' : '🚨 ESCALATE'}
-                    </button>
-                  )}
-                </>
-              )}
-              <button
-                onClick={closeModal}
-                className="flex items-center gap-1.5 bg-transparent border border-[#00e5ff]/30 text-[#00e5ff]/70 hover:bg-[#00e5ff]/10 hover:text-[#00e5ff] font-mono text-[10px] uppercase tracking-wider px-3 h-8 rounded transition-all ml-auto"
-              >
-                ✕ CLOSE
-              </button>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {[
+                  ["Timestamp", selectedIncident.created_at],
+                  ["Location", selectedIncident.location],
+                  ["Event Type", selectedIncident.event_type],
+                  ["Risk Level", selectedIncident.risk_level],
+                  ["Status", selectedIncident.status],
+                  ["Person ID", selectedIncident.person_id || "Unknown"],
+                ].map(([label, value]) => (
+                  <div key={label} className="rounded-md p-3" style={{ background: "var(--bg-primary)", border: "1px solid var(--border)" }}>
+                    <label className="data-label block mb-1">{label}</label>
+                    <p className="text-sm" style={{ color: "var(--text-primary)" }}>{value}</p>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         </div>

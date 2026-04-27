@@ -1,0 +1,64 @@
+version: "3.9"
+
+# ── ThreatSense-AI — Docker Compose ──────────────────────────────────────────
+#
+# Services:
+#   backend   FastAPI + AI pipeline (port 5000)
+#   frontend  Next.js dashboard    (port 3000)
+#
+# Usage:
+#   docker compose up --build          # first run
+#   docker compose up                  # subsequent runs
+#   docker compose down -v             # stop and remove volumes
+#
+# Prerequisites:
+#   1. Copy .env.example to .env and fill in credentials
+#   2. Place models/weapon_detector.pt in the models/ directory
+
+services:
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: threatsense-backend:latest
+    container_name: threatsense_backend
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      - PIPELINE_DEVICE=cpu           # change to cuda:0 for GPU support
+      - THREATSENSE_NO_PIPELINE=0
+    volumes:
+      - ./models:/app/models:ro       # mount model weights read-only
+      - ./logs:/app/logs              # persist logs
+      - db_data:/app/backend          # persist SQLite database
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/system_status')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  frontend:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile.frontend
+    image: threatsense-frontend:latest
+    container_name: threatsense_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:5000/api
+      - NEXT_PUBLIC_WS_URL=ws://localhost:5000/ws
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  db_data:
+    driver: local

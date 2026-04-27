@@ -11,6 +11,12 @@ from risk_logging.audit_logger import AuditLogger
 from utils.time_utils import get_current_timestamp_str, get_current_time_seconds
 from utils.config_loader import load_json_config
 import os
+import time
+
+try:
+    from backend.notifications import notifier as _notifier
+except Exception:
+    _notifier = None
 
 class RiskEngine:
     """
@@ -39,6 +45,8 @@ class RiskEngine:
         self.alert_manager = AlertManager()
         self.event_logger = EventLogger()
         self.audit_logger = AuditLogger()
+        self._last_alert_ts: dict[int | str, float] = {}
+        self._alert_cooldown_s: float = 30.0
         
         # Load decay config
         config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "decay_config.json")
@@ -121,10 +129,32 @@ class RiskEngine:
             "timestamp": get_current_timestamp_str()
         }
         
-        # 11. Trigger alerts
-        self.alert_manager.evaluate_and_alert(result)
-        
+        # 11. Trigger alerts with per-person cooldown to avoid DB spam.
+        if self._should_dispatch_alert(person_id, result):
+            self.alert_manager.evaluate_and_alert(result)
+
+        # 12. Fire email notification on weapon detection
+        if behavior_flags.get("weapon_detected") and _notifier:
+            _notifier.send_weapon_alert(
+                person_id=str(person_id),
+                weapon_class="weapon",
+                confidence=total_score / 100.0,
+                location="Main Entrance",
+            )
+
         return result
+
+    def _should_dispatch_alert(self, person_id: int | str, decision: Dict[str, Any]) -> bool:
+        if not self.alert_manager.rules.should_alert(decision):
+            return False
+
+        now = time.time()
+        last = self._last_alert_ts.get(person_id, 0.0)
+        if now - last < self._alert_cooldown_s:
+            return False
+
+        self._last_alert_ts[person_id] = now
+        return True
 
     def process_frame(self, persons_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """

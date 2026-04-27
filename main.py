@@ -21,6 +21,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core.pipeline import SurveillancePipeline
 
+try:
+    from backend.database import init_db
+except Exception:
+    init_db = None
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -46,14 +51,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--person-model",
-        default="models/yolov8m_fixed.pt",
-        help="Path to the person detector model (default: models/yolov8m_fixed.pt)",
+        default="yolov8m.pt",
+        help="Path to the person detector model (default: yolov8m.pt)",
     )
     p.add_argument(
         "--weapon-model",
-        default="models/weapon_detector_fixed.pt",
+        default="models/weapon_detector.pt",
         help="Path to the weapon detector model "
-             "(default: models/weapon_detector_fixed.pt)",
+             "(default: models/weapon_detector.pt)",
     )
     p.add_argument(
         "--armed-threshold",
@@ -82,6 +87,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    if init_db is not None:
+        init_db()
+
     # Allow bare integer for webcam index
     source = int(args.source) if args.source.isdigit() else args.source
 
@@ -93,7 +101,7 @@ def main() -> None:
     
     if args.cpu_optimized:
         print("[main] CPU optimization active: Using Nano model and 320px resolution.")
-        person_model = "models/yolov8n.pt" # Faster Nano model
+        person_model = "yolov8m.pt"
         imgsz = 320                  # Even lower resolution for CPU
         weapon_skip = 8              # Check weapons every 8 frames
         risk_skip = 5                # Check risk every 5 frames

@@ -1,64 +1,128 @@
 "use client";
 
+import { useState, useEffect, useCallback } from "react";
 import {
   MonitorPlay,
   AlertCircle,
+  BarChart3,
+  Camera,
   Users,
   Shield,
-  Activity
-} from 'lucide-react';
-import Link from 'next/link';
-import { usePathname } from 'next/navigation';
-import { useAuth } from '@/components/AuthProvider';
+} from "lucide-react";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { useAuth } from "@/components/AuthProvider";
+
+interface PipelineStatus {
+  pipeline_running: boolean;
+  camera_connected: boolean;
+}
 
 export default function Sidebar({ className = "" }: { className?: string }) {
   const pathname = usePathname();
   const { role } = useAuth();
+  const [status, setStatus] = useState<PipelineStatus | null>(null);
+
+  const fetchStatus = useCallback(async () => {
+    try {
+      const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+      const res = await fetch(`${API_BASE}/system_status`);
+      if (res.ok) {
+        setStatus(await res.json());
+      }
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 8000);
+    return () => clearInterval(interval);
+  }, [fetchStatus]);
 
   const allNavItems = [
-    { id: 'monitor', path: '/monitor', label: 'LIVE SURVEILLANCE', icon: MonitorPlay, emoji: '📡', roles: null },
-    { id: 'incidents', path: '/incidents', label: 'INCIDENT LOG', icon: AlertCircle, emoji: '📋', roles: null },
-    { id: 'users', path: '/users', label: 'OPERATORS', icon: Users, emoji: '👥', roles: ['admin'] },
+    {
+      id: "monitor",
+      path: "/monitor",
+      label: "Live Monitor",
+      icon: MonitorPlay,
+      roles: null,
+    },
+    {
+      id: "cameras",
+      path: "/cameras",
+      label: "Cameras",
+      icon: Camera,
+      roles: null,
+    },
+    {
+      id: "incidents",
+      path: "/incidents",
+      label: "Incidents",
+      icon: AlertCircle,
+      roles: null,
+    },
+    {
+      id: "analytics",
+      path: "/analytics",
+      label: "Analytics",
+      icon: BarChart3,
+      roles: null,
+    },
+    {
+      id: "performance",
+      path: "/performance",
+      label: "Model Performance",
+      icon: BarChart3,
+      roles: null,
+    },
+    {
+      id: "users",
+      path: "/users",
+      label: "Operators",
+      icon: Users,
+      roles: ["admin"],
+    },
   ];
 
-  // Filter nav items by role
   const navItems = allNavItems.filter((item) => {
-    if (!item.roles) return true; // visible to all roles
-    return item.roles.includes(role || '');
+    if (!item.roles) return true;
+    return item.roles.includes(role || "");
   });
 
+  const pipelineActive = status?.pipeline_running ?? false;
+
   return (
-    <div className={`bg-black/40 backdrop-blur-md border-r border-[#00e5ff]/20 flex flex-col h-screen ${className}`}>
-      {/* Logo Section */}
-      <div className="p-5 border-b border-[#00e5ff]/20">
+    <div
+      className={`flex flex-col h-screen ${className}`}
+      style={{ background: 'var(--bg-secondary)', borderRight: '1px solid var(--border)' }}
+    >
+      {/* Logo */}
+      <div className="p-4" style={{ borderBottom: '1px solid var(--border)' }}>
         <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded border border-[#00e5ff]/40 bg-[#00e5ff]/10 flex items-center justify-center">
-            <Shield className="w-4 h-4 text-[#00e5ff]" />
+          <div
+            className="w-8 h-8 rounded-lg flex items-center justify-center"
+            style={{ background: 'var(--accent-dim)', border: '1px solid rgba(59, 130, 246, 0.2)' }}
+          >
+            <Shield className="w-4 h-4" style={{ color: 'var(--accent)' }} />
           </div>
           <div>
-            <h2 className="text-[#00e5ff] text-sm font-mono font-bold tracking-widest">THREATSENSE</h2>
-            <p className="text-[#00e5ff]/40 text-[10px] font-mono tracking-wider">{'v2.0.4 // ACTIVE'}</p>
+            <h2 className="text-sm font-semibold" style={{ color: 'var(--text-primary)', letterSpacing: '0.02em' }}>
+              ThreatSense
+            </h2>
+            <p className="text-[10px]" style={{ color: 'var(--text-dim)' }}>
+              AI Surveillance
+            </p>
           </div>
-        </div>
-      </div>
-
-      {/* System Status */}
-      <div className="px-4 py-3 border-b border-[#00e5ff]/20">
-        <div className="flex items-center gap-2 mb-2">
-          <Activity className="w-3 h-3 text-[#00e5ff]" />
-          <span className="text-[#00e5ff]/70 text-[10px] font-mono uppercase tracking-widest">SYSTEM STATUS</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="flex-1 h-1 bg-[#00e5ff]/20 rounded-full overflow-hidden">
-            <div className="h-full w-3/4 bg-gradient-to-r from-[#00e5ff] to-[#22c55e] rounded-full shadow-[0_0_8px_#00e5ff]"></div>
-          </div>
-          <span className="text-[#22c55e] text-[10px] font-mono">OPTIMAL</span>
         </div>
       </div>
 
       {/* Navigation */}
-      <nav className="flex-1 p-3 space-y-1">
-        <p className="px-3 mb-2 text-[#00e5ff]/40 text-[10px] font-mono uppercase tracking-widest">{'// NAVIGATION'}</p>
+      <nav className="flex-1 p-2 space-y-0.5 mt-2">
+        <p className="px-3 mb-2 text-[10px] font-medium uppercase" style={{ color: 'var(--text-dim)', letterSpacing: '0.08em' }}>
+          Navigation
+        </p>
         {navItems.map((item) => {
           const Icon = item.icon;
           const isActive = pathname?.startsWith(item.path);
@@ -67,29 +131,33 @@ export default function Sidebar({ className = "" }: { className?: string }) {
             <Link
               key={item.id}
               href={item.path}
-              className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-r transition-all duration-300 text-xs ${isActive
-                ? 'border-l-2 border-[#00e5ff] bg-[#00e5ff]/10 text-[#00e5ff] shadow-[inset_0_0_20px_rgba(0,229,255,0.1)]'
-                : 'border-l-2 border-transparent text-zinc-400 hover:text-[#00e5ff] hover:bg-[#00e5ff]/5 hover:border-[#00e5ff]/50'
-                }`}
+              className="w-full flex items-center gap-2.5 px-3 py-2 rounded-md transition-all text-sm"
+              style={{
+                background: isActive ? 'var(--accent-dim)' : 'transparent',
+                color: isActive ? 'var(--accent)' : 'var(--text-secondary)',
+                fontWeight: isActive ? 500 : 400,
+                borderLeft: isActive ? '2px solid var(--accent)' : '2px solid transparent',
+              }}
             >
-              <Icon className={`w-4 h-4 ${isActive ? 'text-[#00e5ff] drop-shadow-[0_0_4px_#00e5ff]' : ''}`} />
-              <span className="font-mono tracking-wider">{item.emoji} {item.label}</span>
-              {isActive && (
-                <div className="ml-auto w-1.5 h-1.5 rounded-full bg-[#00e5ff] shadow-[0_0_6px_#00e5ff] animate-pulse"></div>
-              )}
+              <Icon className="w-4 h-4" />
+              <span>{item.label}</span>
             </Link>
           );
         })}
       </nav>
 
-      {/* AI Status */}
-      <div className="p-4 border-t border-[#00e5ff]/20">
-        <div className="bg-black/60 border border-[#00e5ff]/20 rounded p-3">
-          <div className="flex items-center gap-2 mb-2">
-            <div className="w-2 h-2 rounded-full bg-[#22c55e] shadow-[0_0_6px_#22c55e] animate-pulse"></div>
-            <span className="text-[#22c55e] text-[10px] font-mono uppercase tracking-widest">🧠 AI ENGINE ACTIVE</span>
+      {/* Pipeline Status Footer — data-driven */}
+      <div className="p-3" style={{ borderTop: '1px solid var(--border)' }}>
+        <div className="p-3 rounded-md" style={{ background: 'var(--bg-primary)', border: '1px solid var(--border)' }}>
+          <div className="flex items-center gap-1.5 mb-1">
+            <div className={`status-dot ${pipelineActive ? 'status-dot-success animate-pulse-dot' : 'status-dot-muted'}`} />
+            <span className="text-[11px] font-medium" style={{ color: pipelineActive ? 'var(--success)' : 'var(--text-muted)' }}>
+              {pipelineActive ? "Pipeline Active" : "Pipeline Offline"}
+            </span>
           </div>
-          <p className="text-zinc-500 text-[10px] font-mono">Neural threat detection online...</p>
+          <p className="text-[10px]" style={{ color: 'var(--text-dim)' }}>
+            {pipelineActive ? "AI detection running" : "No active pipeline"}
+          </p>
         </div>
       </div>
     </div>

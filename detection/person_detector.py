@@ -28,7 +28,7 @@ class PersonDetector:
         model_path: str = "yolov8x.pt",
         device: int | str | None = None,
         imgsz: int = 640,
-        half: bool = False,
+        half: bool = True,
     ) -> None:
         self.model = YOLO(model_path)
         self.device = device

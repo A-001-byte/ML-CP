@@ -1,29 +1,71 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
-# Datasets and model weights (large files)
-datasets/
-models/
-models/*.pt
-models/*.engine
-models/*.onnx
-
-# YOLOv8 run outputs
-runs/
+*.pyw
+.Python
+*.egg-info/
+dist/
+build/
 
 # Virtual environments
 venv/
 env/
-.env
+.venv/
 
-# IDEs
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Model weights (large binary files — store with Git LFS or download separately)
+models/*.pt
+models/*.engine
+models/*.onnx
+*.pt
+*.pth
+*.onnx
+
+# Datasets (too large for git — see training/README for download instructions)
+datasets/
+weapon_merged.zip
+
+# YOLO training runs
+runs/
+
+# Database (runtime file — not source code)
+backend/surveillance.db
+*.db
+*.sqlite3
+
+# Logs (runtime output)
+logs/
+backend/logs/
+*.log
+*.jsonl
+
+# IDE
 .idea/
 .vscode/
+*.swp
+*.swo
 
-# OS generated files
+# OS
 .DS_Store
 Thumbs.db
 
-yolov8x.pt
+# Next.js build artifacts
+dashboard/.next/
+dashboard/node_modules/
+dashboard/tsc_output.txt
+
+# Coverage / test artifacts
+.coverage
+htmlcov/
+.pytest_cache/
+*.coverage
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/

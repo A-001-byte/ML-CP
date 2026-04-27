@@ -6,6 +6,8 @@ Run with: python -m pytest tests/test_risk_engine.py -v
 import unittest
 import os
 import sys
+import contextlib
+from unittest.mock import patch
 
 # Ensure project root is on the path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,6 +17,7 @@ from engine.behavior_fusion import BehaviorFusion
 from engine.risk_calculator import RiskCalculator
 from memory.person_memory import PersonMemory
 from alerts.alert_rules import AlertRules
+from engine.risk_engine import RiskEngine
 
 
 class TestThreatClassifier(unittest.TestCase):
@@ -117,6 +120,67 @@ class TestAlertRules(unittest.TestCase):
     def test_critical_priority(self):
         decision = {"risk_score": 110, "behaviors": ["weapon_detected"]}
         self.assertEqual(self.rules.get_alert_priority(decision), "CRITICAL_ALARM")
+
+
+class TestRiskEngineAlertDeduplication(unittest.TestCase):
+    def _engine_with_spy(self):
+        engine = RiskEngine()
+        dispatched = []
+        engine.alert_manager.evaluate_and_alert = lambda decision: dispatched.append(decision)
+        return engine, dispatched
+
+    def test_alert_deduplication_within_cooldown(self):
+        engine, dispatched = self._engine_with_spy()
+        person = {"id": 42, "weapon_detected": True}
+
+        with patch("engine.risk_engine.time.time", return_value=1000.0):
+            engine.process_person(person)
+        with patch("engine.risk_engine.time.time", return_value=1005.0):
+            engine.process_person(person)
+
+        self.assertEqual(len(dispatched), 1)
+
+    def test_alert_after_cooldown_creates_new(self):
+        engine, dispatched = self._engine_with_spy()
+        person = {"id": 42, "weapon_detected": True}
+
+        with patch("engine.risk_engine.time.time", return_value=1000.0):
+            engine.process_person(person)
+        with patch("engine.risk_engine.time.time", return_value=1031.0):
+            engine.process_person(person)
+
+        self.assertEqual(len(dispatched), 2)
+
+
+def _count_alerts() -> int:
+    from backend.database import get_db_connection
+
+    with contextlib.closing(get_db_connection()) as conn:
+        return conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+
+
+def test_alert_deduplication_within_cooldown_db(tmp_db):
+    engine = RiskEngine()
+    person = {"id": 77, "weapon_detected": True}
+
+    with patch("engine.risk_engine.time.time", return_value=1000.0):
+        engine.process_person(person)
+    with patch("engine.risk_engine.time.time", return_value=1005.0):
+        engine.process_person(person)
+
+    assert _count_alerts() == 1
+
+
+def test_alert_after_cooldown_creates_new_db(tmp_db):
+    engine = RiskEngine()
+    person = {"id": 77, "weapon_detected": True}
+
+    with patch("engine.risk_engine.time.time", return_value=1000.0):
+        engine.process_person(person)
+    with patch("engine.risk_engine.time.time", return_value=1031.0):
+        engine.process_person(person)
+
+    assert _count_alerts() == 2
 
 
 if __name__ == "__main__":

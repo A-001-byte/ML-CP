@@ -3,6 +3,14 @@ import os
 import sys
 import secrets
 import contextlib
+from datetime import datetime, timezone, timedelta
+
+# Indian Standard Time = UTC+5:30
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+def ist_now() -> str:
+    """Current time as an IST datetime string (stored in DB and returned to frontend)."""
+    return datetime.now(_IST).strftime('%Y-%m-%d %H:%M:%S')
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -57,14 +65,30 @@ def init_db():
                 risk_level TEXT DEFAULT 'low',
                 status TEXT DEFAULT 'open',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                resolved_at DATETIME
+                resolved_at DATETIME,
+                clip_path TEXT,
+                person_id TEXT,
+                camera_id TEXT DEFAULT 'CAM-01'
             )
         ''')
+
+        _ensure_columns(cursor, "incidents", {
+            "clip_path": "TEXT",
+            "person_id": "TEXT",
+            "camera_id": "TEXT DEFAULT 'CAM-01'",
+        })
 
         # Seed default data if tables are empty
         _seed_data(cursor)
 
         conn.commit()
+
+
+def _ensure_columns(cursor, table: str, columns: dict[str, str]) -> None:
+    existing = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, ddl in columns.items():
+        if name not in existing:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
 def _seed_data(cursor):
@@ -93,49 +117,16 @@ def _seed_data(cursor):
         viewer_pass = viewer_pass or secrets.token_urlsafe(12)
 
         users = [
-            (admin_user, generate_password_hash(admin_pass), "admin", "Active", "Just now"),
-            ("operator1", generate_password_hash(operator_pass), "security", "Active", "12 min ago"),
-            ("viewer1", generate_password_hash(viewer_pass), "viewer", "Active", "1 hour ago"),
+            (admin_user, generate_password_hash(admin_pass), "admin", "Active", "N/A"),
+            ("operator1", generate_password_hash(operator_pass), "security", "Active", "N/A"),
+            ("viewer1", generate_password_hash(viewer_pass), "viewer", "Active", "N/A"),
         ]
         cursor.executemany(
             'INSERT INTO users (username, password_hash, role, status, last_active) VALUES (?, ?, ?, ?, ?)',
             users
         )
 
-    # Seed alerts
-    cursor.execute('SELECT COUNT(*) FROM alerts')
-    if cursor.fetchone()[0] == 0:
-        alerts = [
-            ("P-001", "Suspicious Behavior", 0.73, "medium", "2026-03-05 14:11:30", "CAM-01", "Main Entrance", "Active"),
-            ("P-002", "Loitering Detected",  0.55, "medium", "2026-03-05 14:05:18", "CAM-01", "Main Entrance", "Under Review"),
-            ("P-003", "Motion Detected",     0.20, "low",    "2026-03-05 13:58:22", "CAM-01", "Main Entrance", "Resolved"),
-            ("P-004", "Person Detected",     0.15, "low",    "2026-03-05 14:18:45", "CAM-01", "Main Entrance", "Resolved"),
-            ("P-005", "Motion Detected",     0.10, "low",    "2026-03-05 14:23:12", "CAM-01", "Main Entrance", "Resolved"),
-        ]
-        cursor.executemany(
-            'INSERT INTO alerts (person_id, event_type, risk_score, risk_level, timestamp, camera_id, location, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            alerts
-        )
-
-    # Seed incidents
-    cursor.execute('SELECT COUNT(*) FROM incidents')
-    if cursor.fetchone()[0] == 0:
-        incidents = [
-            ("Unauthorized Access",  "Unauthorized person detected at main entrance", "Unauthorized Access",  "Main Entrance", "high",   "Resolved",      "2026-03-05 14:23:45", None),
-            ("Suspicious Behavior",  "Unusual movement pattern in monitored zone",    "Suspicious Behavior",  "Main Entrance", "medium", "Under Review",  "2026-03-05 13:15:22", None),
-            ("Loitering Detected",   "Person stayed in restricted area too long",     "Loitering Detected",   "Main Entrance", "medium", "Resolved",      "2026-03-05 12:08:11", None),
-            ("Motion Detected",      "Motion detected during monitoring",             "Motion Detected",      "Main Entrance", "low",    "Resolved",      "2026-03-05 10:45:33", None),
-            ("Person Detected",      "Person detected at entrance",                   "Person Detected",      "Main Entrance", "low",    "Resolved",      "2026-03-05 09:30:18", None),
-            ("Motion After Hours",   "Motion detected outside operating hours",       "Motion After Hours",   "Main Entrance", "medium", "Resolved",      "2026-03-04 22:12:44", None),
-            ("Suspicious Behavior",  "Suspicious activity near exit",                 "Suspicious Behavior",  "Main Entrance", "high",   "Resolved",      "2026-03-04 18:55:09", None),
-            ("Aggressive Behavior",  "Aggressive movement pattern detected",          "Aggressive Behavior",  "Main Entrance", "high",   "Escalated",     "2026-03-04 16:20:55", None),
-            ("Loitering Detected",   "Prolonged presence in restricted zone",         "Loitering Detected",   "Main Entrance", "medium", "False Alarm",   "2026-03-04 14:08:12", None),
-            ("Person Detected",      "Person entering monitored zone",                "Person Detected",      "Main Entrance", "low",    "Resolved",      "2026-03-04 11:45:30", None),
-        ]
-        cursor.executemany(
-            'INSERT INTO incidents (title, description, event_type, location, risk_level, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            incidents
-        )
+    # No seed alerts or incidents — the system populates real data from the AI pipeline
 
 
 def add_alert(person_id, event_type, risk_score, risk_level, camera_id="CAM-01", location="Main Entrance", status="Active"):
@@ -201,15 +192,26 @@ def add_alert(person_id, event_type, risk_score, risk_level, camera_id="CAM-01",
     with contextlib.closing(get_db_connection()) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            '''INSERT INTO alerts (person_id, event_type, risk_score, risk_level, camera_id, location, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?)''',
-            (str(person_id).strip(), str(event_type).strip(), risk_score, risk_level, camera_id, location, status)
+            '''INSERT INTO alerts (person_id, event_type, risk_score, risk_level, camera_id, location, status, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+            (str(person_id).strip(), str(event_type).strip(), risk_score, risk_level,
+             camera_id, location, status, ist_now())
         )
         conn.commit()
         return cursor.lastrowid
 
 
-def add_incident(title, description, event_type, location="Main Entrance", risk_level="low", status="open"):
+def add_incident(
+    title,
+    description,
+    event_type,
+    location="Main Entrance",
+    risk_level="low",
+    status="open",
+    clip_path=None,
+    person_id=None,
+    camera_id="CAM-01",
+):
     """
     Persists a new incident to the database.
     
@@ -267,9 +269,21 @@ def add_incident(title, description, event_type, location="Main Entrance", risk_
     with contextlib.closing(get_db_connection()) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            '''INSERT INTO incidents (title, description, event_type, location, risk_level, status)
-               VALUES (?, ?, ?, ?, ?, ?)''',
-            (str(title).strip(), description, str(event_type).strip(), location, risk_level, status)
+            '''INSERT INTO incidents
+               (title, description, event_type, location, risk_level, status, created_at, clip_path, person_id, camera_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (
+                str(title).strip(),
+                description,
+                str(event_type).strip(),
+                location,
+                risk_level,
+                status,
+                ist_now(),
+                str(clip_path) if clip_path else None,
+                str(person_id).strip() if person_id is not None else None,
+                str(camera_id).strip() if camera_id else "CAM-01",
+            )
         )
         conn.commit()
         return cursor.lastrowid

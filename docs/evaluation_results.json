@@ -1,0 +1,34 @@
+{
+  "evaluated_at": "2026-04-27 17:51:42 IST",
+  "model": "weapon_detector.pt",
+  "dataset": "E:\\Pick-me-Programmers\\datasets\\weapon_merged\\data.yaml",
+  "split": "test",
+  "classes": [
+    "gun",
+    "knife",
+    "person"
+  ],
+  "overall": {
+    "mAP50": 0.8924,
+    "mAP50-95": 0.6581,
+    "precision": 0.8365,
+    "recall": 0.8667
+  },
+  "per_class": {
+    "gun": {
+      "mAP50-95": 0.6401,
+      "precision": 0.8954,
+      "recall": 0.8773
+    },
+    "knife": {
+      "mAP50-95": 0.6926,
+      "precision": 0.8599,
+      "recall": 0.9469
+    },
+    "person": {
+      "mAP50-95": 0.6415,
+      "precision": 0.7543,
+      "recall": 0.7757
+    }
+  }
+}

@@ -1,21 +1,42 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { useRouter } from "next/navigation";
+import { useAuth } from "@/components/AuthProvider";
 import {
   Activity,
   AlertTriangle,
   BellOff,
   Check,
   Clock,
+  Cpu,
+  Download,
   Eye,
   Gauge,
-  Play,
+  Monitor,
+  Pencil,
+  Trash2,
   Video,
-  Waves,
+  Wifi,
+  WifiOff,
   X,
+  Zap,
 } from "lucide-react";
-import { acknowledgeAlert, dismissAlert, getAlerts, getStats, resolveAlert, bulkDismissAlerts } from "@/lib/api";
+import {
+  acknowledgeAlert,
+  dismissAlert,
+  getAlerts,
+  getDetectionZone,
+  getStats,
+  resolveAlert,
+  bulkDismissAlerts,
+  updateDetectionZone,
+  clearDetectionZone,
+  ZonePoint,
+} from "@/lib/api";
+import { useWebSocket, WSMessage } from "@/lib/socket";
+import { getApiToken } from "@/lib/api";
+
+// â”€â”€ Types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 interface Alert {
   id: number;
@@ -41,62 +62,354 @@ interface Stats {
   last_frame_age_s: number | null;
 }
 
-// Inlined siren tone to avoid third-party requests blocked by tracking prevention.
-const SIREN_URL = "data:audio/ogg;base64,T2dnUwACAAAAAAAAAABY1s4bAAAAACFzEykBHgF2b3JiaXMAAAAAAkSsAAAAAAAAgDgAAAAAAAC4AU9nZ1MAAAAAAAAAAAAAWNfOGwEAAAAhcxMpBToBX29yYmlzAAAAAAJEbAAAAAAAAGAOAAAAAAAAuAFPZ2dTAAAAAAAAAAAAAFjXzhsCAAAAIHMTKQE2AVZvcmJpcwAAAAACRGwAAAAAAABgDgAAAAAAALgBT2dnUwAAAAAAAAAAAAAAYtfOGwMAAACRc5MpATYBX29yYmlzAAAAAAJEbAAAAAAAAGAOAAAAAAAAuAFPZ2dTAAAAAAAAAAAAAFjYzhsEAAAAJ3MTKQEyAVZvcmJpcwAAAAACRGwAAAAAAABgDgAAAAAAALgBT2dnUwAAAAAAAAAAAAAAYuTOGwUAAACecxMpAR4BX29yYmlzAAAAAAJEbAAAAAAAAGAOAAAAAAAAuAFPZ2dTAAAAAAAAAAAAAFjZzhsGAAAAnXMTKQEeAV9vcmJpcwAAAAACRGwAAAAAAABgDgAAAAAAALgBT2dnUwAAAAAAAAAAAAAAYtnOGwcAAACkc5MpAR4BX29yYmlzAAAAAAJEbAAAAAAAAGAOAAAAAAAAuAFPZ2dTAAAAAAAAAAAAAFjczhsIAAAArXMTKQEeAV9vcmJpcwAAAAACRGwAAAAAAABgDgAAAAAAALgBAAAAAQAAAP//AA==";
+interface SystemMetrics {
+  pipeline_fps: number | null;
+  pipeline_running: boolean;
+  pipeline_frames: number;
+  last_frame_age_s: number | null;
+  gpu_available: boolean;
+  gpu_info: {
+    name: string;
+    memory_allocated_mb: number;
+    memory_reserved_mb: number;
+    memory_total_mb: number;
+  } | null;
+  device: string;
+}
 
-function MetricBar({
+interface PixelPoint {
+  x: number;
+  y: number;
+}
+
+interface WeaponAlertPayload {
+  person_id: number | string;
+  weapon_class: string;
+  confidence: number;
+  location: string;
+  timestamp: string;
+}
+
+interface WeaponToast extends WeaponAlertPayload {
+  id: string;
+}
+
+function isWeaponAlertPayload(data: Record<string, unknown> | undefined): data is Record<string, unknown> & WeaponAlertPayload {
+  return Boolean(
+    data &&
+    (typeof data.person_id === "number" || typeof data.person_id === "string") &&
+    typeof data.weapon_class === "string" &&
+    typeof data.confidence === "number" &&
+    typeof data.location === "string" &&
+    typeof data.timestamp === "string"
+  );
+}
+
+function playAlarm() {
+  try {
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.setValueAtTime(880, ctx.currentTime);
+    osc.frequency.setValueAtTime(660, ctx.currentTime + 0.3);
+    gain.gain.setValueAtTime(0.3, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.8);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.8);
+  } catch {
+    // Browsers can block audio before user interaction; the toast still appears.
+  }
+}
+
+function distance(a: PixelPoint, b: PixelPoint): number {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function ZoneCanvas({
+  savedZone,
+  drawing,
+  onComplete,
+}: {
+  savedZone: ZonePoint[];
+  drawing: boolean;
+  onComplete: (points: ZonePoint[]) => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [size, setSize] = useState({ width: 0, height: 0 });
+  const [draft, setDraft] = useState<PixelPoint[]>([]);
+  const [cursor, setCursor] = useState<PixelPoint | null>(null);
+  const wasDrawing = useRef(false);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const parent = canvas?.parentElement;
+    if (!canvas || !parent) return;
+
+    const syncSize = () => {
+      const rect = parent.getBoundingClientRect();
+      const width = Math.max(1, Math.round(rect.width));
+      const height = Math.max(1, Math.round(rect.height));
+      canvas.width = width;
+      canvas.height = height;
+      setSize({ width, height });
+    };
+
+    syncSize();
+    const observer = new ResizeObserver(syncSize);
+    observer.observe(parent);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (drawing && !wasDrawing.current) {
+      setDraft([]);
+      setCursor(null);
+    }
+    wasDrawing.current = drawing;
+  }, [drawing]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (savedZone.length >= 3) {
+      ctx.beginPath();
+      savedZone.forEach((point, index) => {
+        const x = point.x * canvas.width;
+        const y = point.y * canvas.height;
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.closePath();
+      ctx.fillStyle = "rgba(0, 255, 0, 0.15)";
+      ctx.strokeStyle = "rgba(0, 255, 0, 0.95)";
+      ctx.lineWidth = 2;
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    if (drawing) {
+      if (draft.length > 0) {
+        ctx.beginPath();
+        draft.forEach((point, index) => {
+          if (index === 0) ctx.moveTo(point.x, point.y);
+          else ctx.lineTo(point.x, point.y);
+        });
+        ctx.strokeStyle = "rgba(255,255,255,0.95)";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        if (cursor) {
+          const last = draft[draft.length - 1];
+          ctx.beginPath();
+          ctx.setLineDash([7, 7]);
+          ctx.moveTo(last.x, last.y);
+          ctx.lineTo(cursor.x, cursor.y);
+          ctx.strokeStyle = "rgba(255,255,255,0.65)";
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
+
+      draft.forEach((point, index) => {
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, index === 0 ? 8 : 6, 0, Math.PI * 2);
+        ctx.fillStyle = "white";
+        ctx.fill();
+        ctx.strokeStyle = index === 0 ? "#22c55e" : "rgba(0,0,0,0.4)";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      });
+    }
+  }, [cursor, draft, drawing, savedZone, size]);
+
+  const pointFromEvent = (event: React.MouseEvent<HTMLCanvasElement>): PixelPoint => {
+    const canvas = event.currentTarget;
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: ((event.clientX - rect.left) / rect.width) * canvas.width,
+      y: ((event.clientY - rect.top) / rect.height) * canvas.height,
+    };
+  };
+
+  const handleClick = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!drawing) return;
+    const point = pointFromEvent(event);
+    if (draft.length >= 3 && distance(point, draft[0]) <= 15) {
+      onComplete(draft.map((item) => ({
+        x: Math.min(1, Math.max(0, item.x / Math.max(1, event.currentTarget.width))),
+        y: Math.min(1, Math.max(0, item.y / Math.max(1, event.currentTarget.height))),
+      })));
+      setDraft([]);
+      setCursor(null);
+      return;
+    }
+    setDraft((prev) => [...prev, point]);
+  };
+
+  return (
+    <canvas
+      ref={canvasRef}
+      className="absolute inset-0 w-full h-full"
+      style={{ pointerEvents: drawing ? "all" : "none", cursor: drawing ? "crosshair" : "default" }}
+      onClick={handleClick}
+      onMouseMove={(event) => drawing && setCursor(pointFromEvent(event))}
+      onMouseLeave={() => setCursor(null)}
+      aria-label="Detection zone drawing canvas"
+    />
+  );
+}
+
+// â”€â”€ SVG Threat Timeline â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function ThreatTimeline({ alerts }: { alerts: Alert[] }) {
+  const WIDTH = 600;
+  const HEIGHT = 80;
+  const PADDING = 4;
+
+  const data = alerts
+    .slice(0, 30)
+    .reverse()
+    .map((a) => Math.min(1, Math.max(0, a.risk_score ?? 0)));
+
+  if (data.length < 2) {
+    return (
+      <div className="flex items-center justify-center h-20 text-xs" style={{ color: 'var(--text-dim)' }}>
+        Awaiting threat dataâ€¦
+      </div>
+    );
+  }
+
+  const stepX = (WIDTH - PADDING * 2) / (data.length - 1);
+  const getY = (val: number) =>
+    PADDING + (1 - val) * (HEIGHT - PADDING * 2);
+
+  const points = data.map(
+    (val, i) => `${PADDING + i * stepX},${getY(val)}`
+  );
+  const linePath = `M${points.join("L")}`;
+  const areaPath = `${linePath}L${PADDING + (data.length - 1) * stepX},${HEIGHT}L${PADDING},${HEIGHT}Z`;
+
+  const maxRisk = Math.max(...data);
+  const lineColor =
+    maxRisk > 0.7 ? "#ef4444" : maxRisk > 0.4 ? "#f59e0b" : "#22c55e";
+  const fillColor =
+    maxRisk > 0.7
+      ? "rgba(239,68,68,0.06)"
+      : maxRisk > 0.4
+        ? "rgba(245,158,11,0.05)"
+        : "rgba(34,197,94,0.04)";
+
+  return (
+    <svg
+      viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
+      className="w-full h-20"
+      preserveAspectRatio="none"
+    >
+      {[0.25, 0.5, 0.75].map((v) => (
+        <line
+          key={v}
+          x1={PADDING}
+          y1={getY(v)}
+          x2={WIDTH - PADDING}
+          y2={getY(v)}
+          stroke="rgba(255,255,255,0.04)"
+          strokeWidth="0.5"
+        />
+      ))}
+      <path d={areaPath} fill={fillColor} />
+      <path
+        d={linePath}
+        fill="none"
+        stroke={lineColor}
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <circle
+        cx={PADDING + (data.length - 1) * stepX}
+        cy={getY(data[data.length - 1])}
+        r="3"
+        fill={lineColor}
+      />
+    </svg>
+  );
+}
+
+// â”€â”€ Metric Card â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function MetricCard({
   label,
   value,
-  color,
-  compact = false,
+  color = "var(--accent)",
+  icon: Icon,
 }: {
   label: string;
   value: string;
-  color: string;
-  compact?: boolean;
+  color?: string;
+  icon?: React.ComponentType<{ className?: string }>;
 }) {
   return (
-    <div className="bg-[#0b0f18] border border-[#00e5ff]/10 rounded px-3 py-2 flex items-center justify-between">
-      <span className="text-[11px] uppercase tracking-widest text-zinc-400">{label}</span>
-      <span className="text-sm font-semibold" style={{ color }}>
-        {value}
-      </span>
-      {!compact && (
-        <div className="ml-3 flex-1 h-1.5 bg-[#050a12] rounded overflow-hidden">
-          <div
-            className="h-full"
-            style={{ width: "70%", background: `linear-gradient(90deg, ${color}, rgba(0,229,255,0.2))` }}
-          ></div>
-        </div>
+    <div className="flex items-center gap-3 px-3 py-2.5 rounded-md" style={{ background: 'var(--bg-primary)', border: '1px solid var(--border)' }}>
+      {Icon && (
+        <span className="flex-shrink-0" style={{ color }}>
+          <Icon className="w-3.5 h-3.5" />
+        </span>
       )}
+      <div className="flex-1 min-w-0">
+        <div className="data-label truncate">{label}</div>
+        <div className="data-value mt-0.5" style={{ color }}>
+          {value}
+        </div>
+      </div>
     </div>
   );
 }
 
+// â”€â”€ Main Component â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
 export default function LiveMonitor() {
-  const router = useRouter();
+  const { token } = useAuth();
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
+  const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState<number | null>(null);
-  const [bannerVisible, setBannerVisible] = useState(true);
   const [alarmMuted, setAlarmMuted] = useState(() => {
-    if (typeof window !== "undefined") return localStorage.getItem("alarmMuted") === "true";
+    if (typeof window !== "undefined")
+      return localStorage.getItem("alarmMuted") === "true";
     return false;
   });
-  const [showAllTimeline, setShowAllTimeline] = useState(false);
   const [bulkDismissing, setBulkDismissing] = useState(false);
-  const [replayAlert, setReplayAlert] = useState<Alert | null>(null);
-  const [replayFrames, setReplayFrames] = useState<{ id: number; timestamp: string }[]>([]);
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
   const [snapshotUrl, setSnapshotUrl] = useState<string | null>(null);
   const [currentFeed, setCurrentFeed] = useState<string | null>(null);
-  const fallbackInterval = useRef<NodeJS.Timeout | null>(null);
-  const hasTriedStream = useRef<boolean>(false);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [zonePoints, setZonePoints] = useState<ZonePoint[]>([]);
+  const [drawingZone, setDrawingZone] = useState(false);
+  const [zoneSaving, setZoneSaving] = useState(false);
+  const [weaponToasts, setWeaponToasts] = useState<WeaponToast[]>([]);
+  const fallbackInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const hasTriedStream = useRef(false);
+  const alarmMutedRef = useRef(alarmMuted);
 
+  useEffect(() => {
+    alarmMutedRef.current = alarmMuted;
+  }, [alarmMuted]);
+
+  // Derived state
   const activeAlerts = useMemo(
-    () => alerts.filter((a) => (a.status || "").toLowerCase() !== "resolved" && (a.status || "").toLowerCase() !== "dismissed"),
+    () =>
+      alerts.filter(
+        (a) =>
+          (a.status || "").toLowerCase() !== "resolved" &&
+          (a.status || "").toLowerCase() !== "dismissed"
+      ),
     [alerts]
   );
 
@@ -109,59 +422,111 @@ export default function LiveMonitor() {
     [activeAlerts]
   );
 
-  const riskPercent = useMemo(() => {
-    if (!activeAlerts.length) return 12;
-    const maxScore = Math.max(...activeAlerts.map((a) => a.risk_score ?? 0));
-    return Math.min(100, Math.max(8, Math.round(maxScore * 10)));
-  }, [activeAlerts]);
+  // â”€â”€ WebSocket â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-  const riskLabel = riskPercent > 70 ? "Critical" : riskPercent > 45 ? "Elevated" : riskPercent > 20 ? "Guarded" : "Stable";
+  const dismissWeaponToast = useCallback((id: string) => {
+    setWeaponToasts((prev) => prev.filter((toast) => toast.id !== id));
+  }, []);
 
-  const radarBlips = useMemo(() => {
-    const palette = ["#ff2d55", "#ffc400", "#1de9b6", "#00e5ff"];
-    return activeAlerts.slice(0, 12).map((alert, idx) => ({
-      id: alert.id,
-      cx: 20 + ((alert.risk_score ?? idx) % 60),
-      cy: 15 + ((alert.risk_score ?? idx * 3) % 70),
-      color: palette[idx % palette.length],
-    }));
-  }, [activeAlerts]);
+  const handleWSMessage = useCallback((msg: WSMessage) => {
+    if (msg.type === "new_alert" && msg.data) {
+      setAlerts((prev) => [msg.data as unknown as Alert, ...prev]);
+    }
+    if (msg.type === "stats_update" && msg.data) {
+      setStats(msg.data as unknown as Stats);
+    }
+    if (msg.type === "weapon_alert" && isWeaponAlertPayload(msg.data)) {
+      const id = `${Date.now()}-${msg.data.person_id}-${msg.data.weapon_class}`;
+      const toast: WeaponToast = { ...msg.data, id };
+      setWeaponToasts((prev) => [...prev, toast].slice(-3));
+      window.setTimeout(() => dismissWeaponToast(id), 8000);
+      if (!alarmMutedRef.current) playAlarm();
+    }
+  }, [dismissWeaponToast]);
+
+  const { status: wsStatus } = useWebSocket(handleWSMessage);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    document.title = weaponToasts.length > 0 ? "⚠ ALERT — ThreatSense-AI" : "ThreatSense-AI";
+  }, [weaponToasts.length]);
+
+  // â”€â”€ Initial data load â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   const fetchData = useCallback(async () => {
     try {
       setLoading(true);
-      const [alertRes, statsRes] = await Promise.all([getAlerts(50), getStats()]);
-      const incomingAlerts = Array.isArray(alertRes?.alerts) ? alertRes.alerts : Array.isArray(alertRes) ? alertRes : [];
-      setAlerts(incomingAlerts as Alert[]);
+      const [alertRes, statsRes] = await Promise.all([
+        getAlerts(50),
+        getStats(),
+      ]);
+      const incoming = Array.isArray(alertRes?.alerts)
+        ? alertRes.alerts
+        : Array.isArray(alertRes)
+          ? alertRes
+          : [];
+      setAlerts(incoming as Alert[]);
       setStats(statsRes as Stats);
-    } catch (error) {
-      console.error("Failed to load dashboard data", error);
+    } catch (err) {
+      console.error("Failed to load dashboard data", err);
     } finally {
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 15000);
-    return () => clearInterval(interval);
-  }, [fetchData]);
+  // Fetch system metrics (device info, GPU)
+  const fetchMetrics = useCallback(async () => {
+    try {
+      const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
+      const res = await fetch(`${API_BASE}/system_metrics`);
+      if (res.ok) {
+        setMetrics(await res.json());
+      }
+    } catch {
+      // Silently ignore
+    }
+  }, []);
 
   useEffect(() => {
-    const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
-    const streamBase = process.env.NEXT_PUBLIC_VIDEO_FEED_URL || "http://localhost:5000/api/video_feed";
-    const snapBase = process.env.NEXT_PUBLIC_VIDEO_FRAME_URL || "http://localhost:5000/api/frame";
-    const stream = token ? `${streamBase}?token=${encodeURIComponent(token)}` : streamBase;
-    const snap = token ? `${snapBase}?token=${encodeURIComponent(token)}` : snapBase;
+    fetchData();
+    fetchMetrics();
+    getDetectionZone()
+      .then((zone) => {
+        const points = Array.isArray(zone.points) ? zone.points : [];
+        setZonePoints(points);
+      })
+      .catch(() => {});
+    const metricsInterval = setInterval(fetchMetrics, 10000);
+    return () => clearInterval(metricsInterval);
+  }, [fetchData, fetchMetrics]);
+
+  // â”€â”€ Video feed URLs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  useEffect(() => {
+    // Use in-memory token (never from localStorage) for cross-port video feed auth
+    const streamBase =
+      process.env.NEXT_PUBLIC_VIDEO_FEED_URL ||
+      "http://localhost:5000/api/video_feed";
+    const snapBase =
+      process.env.NEXT_PUBLIC_VIDEO_FRAME_URL ||
+      "http://localhost:5000/api/frame";
+    const stream = token
+      ? `${streamBase}?token=${encodeURIComponent(token)}`
+      : streamBase;
+    const snap = token
+      ? `${snapBase}?token=${encodeURIComponent(token)}`
+      : snapBase;
     setStreamUrl(stream);
     setSnapshotUrl(snap);
     setCurrentFeed(stream);
-  }, []);
+  }, [token]);
 
   const startSnapshotFallback = useCallback(() => {
-    if (!snapshotUrl) return;
-    if (fallbackInterval.current) return;
-    const tick = () => setCurrentFeed(`${snapshotUrl}${snapshotUrl.includes("?") ? "&" : "?"}ts=${Date.now()}`);
+    if (!snapshotUrl || fallbackInterval.current) return;
+    const tick = () =>
+      setCurrentFeed(
+        `${snapshotUrl}${snapshotUrl.includes("?") ? "&" : "?"}ts=${Date.now()}`
+      );
     tick();
     fallbackInterval.current = setInterval(tick, 1500);
   }, [snapshotUrl]);
@@ -173,17 +538,7 @@ export default function LiveMonitor() {
     }
   }, []);
 
-  useEffect(() => {
-    if (!highRiskAlert || alarmMuted) return;
-    if (!audioRef.current) {
-      audioRef.current = new Audio(SIREN_URL);
-      audioRef.current.loop = true;
-    }
-    audioRef.current.play().catch(() => undefined);
-    return () => {
-      audioRef.current?.pause();
-    };
-  }, [highRiskAlert, alarmMuted]);
+  // â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   const formatTime = (timestamp: string) => {
     const dt = new Date(timestamp);
@@ -196,79 +551,50 @@ export default function LiveMonitor() {
     });
   };
 
-  const getRiskColor = (risk?: string) => {
-    const level = (risk || "").toLowerCase();
-    if (level === "high" || level === "critical") return "border-red-500/50 text-red-400";
-    if (level === "medium") return "border-yellow-400/50 text-yellow-300";
-    return "border-[#1de9b6]/40 text-[#1de9b6]";
+  const getBadgeClass = (risk?: string) => {
+    const lvl = (risk || "").toLowerCase();
+    if (lvl === "critical") return "badge badge-critical";
+    if (lvl === "high") return "badge badge-high";
+    if (lvl === "medium") return "badge badge-medium";
+    return "badge badge-low";
   };
 
-  const handleReviewAlert = (alert: Alert) => {
-    setReplayAlert(alert);
-    const now = Date.now();
-    const frames = Array.from({ length: 6 }, (_, idx) => ({
-      id: idx,
-      timestamp: new Date(now - (5 - idx) * 1500).toLocaleTimeString(),
-    }));
-    setReplayFrames(frames);
-  };
-
-  const handleEventClick = (alert: Alert) => handleReviewAlert(alert);
+  // â”€â”€ Alert actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   const updateAlertStatus = (id: number, status: string) => {
-    setAlerts((prev) => prev.map((a) => (a.id === id ? { ...a, status } : a)));
+    setAlerts((prev) =>
+      prev.map((a) => (a.id === id ? { ...a, status } : a))
+    );
   };
 
-  const handleAcknowledgeAlert = async (id: number) => {
+  const handleAck = async (id: number) => {
     setActionLoading(id);
     try {
       await acknowledgeAlert(id);
-      updateAlertStatus(id, "acknowledged");
-    } catch (error) {
-      console.error("Ack failed", error);
-    } finally {
+      updateAlertStatus(id, "Under Review");
+    } catch { /* ignore */ } finally {
       setActionLoading(null);
     }
   };
 
-  const handleResolveAlert = async (id: number) => {
+  const handleResolve = async (id: number) => {
     setActionLoading(id);
     try {
       await resolveAlert(id);
-      updateAlertStatus(id, "resolved");
-    } catch (error) {
-      console.error("Resolve failed", error);
-    } finally {
+      updateAlertStatus(id, "Resolved");
+    } catch { /* ignore */ } finally {
       setActionLoading(null);
     }
   };
 
-  const handleDismissAlert = async (id: number) => {
+  const handleDismiss = async (id: number) => {
     setActionLoading(id);
     try {
       await dismissAlert(id);
-      updateAlertStatus(id, "dismissed");
-    } catch (error) {
-      console.error("Dismiss failed", error);
-    } finally {
+      updateAlertStatus(id, "Dismissed");
+    } catch { /* ignore */ } finally {
       setActionLoading(null);
     }
-  };
-
-  const handleDismissBannerAlert = async () => {
-    if (!highRiskAlert) return;
-    await handleDismissAlert(highRiskAlert.id);
-    setBannerVisible(false);
-  };
-
-  const handleBannerDismiss = () => setBannerVisible(false);
-
-  const toggleAlarmMuted = () => {
-    setAlarmMuted((prev) => {
-      const next = !prev;
-      if (typeof window !== "undefined") localStorage.setItem("alarmMuted", String(next));
-      return next;
-    });
   };
 
   const handleBulkDismiss = async () => {
@@ -276,81 +602,186 @@ export default function LiveMonitor() {
     try {
       await bulkDismissAlerts();
       await fetchData();
-    } catch (err) {
-      console.error("Bulk dismiss failed", err);
-    } finally {
+    } catch { /* ignore */ } finally {
       setBulkDismissing(false);
     }
   };
 
-  const TIMELINE_LIMIT = 10;
-  const visibleTimelineAlerts = showAllTimeline ? alerts : alerts.slice(0, TIMELINE_LIMIT);
-  const hasMoreAlerts = alerts.length > TIMELINE_LIMIT;
+  const toggleMute = () => {
+    setAlarmMuted((prev) => {
+      const next = !prev;
+      if (typeof window !== "undefined")
+        localStorage.setItem("alarmMuted", String(next));
+      return next;
+    });
+  };
+
+  const completeZone = async (points: ZonePoint[]) => {
+    setZoneSaving(true);
+    try {
+      const zone = await updateDetectionZone(points);
+      setZonePoints(zone.points || []);
+      setDrawingZone(false);
+    } finally {
+      setZoneSaving(false);
+    }
+  };
+
+  const clearZone = async () => {
+    setZoneSaving(true);
+    try {
+      await clearDetectionZone();
+      setZonePoints([]);
+      setDrawingZone(false);
+    } finally {
+      setZoneSaving(false);
+    }
+  };
+
+  // Derive device label from real metrics
+  const deviceLabel = metrics?.gpu_available
+    ? metrics.gpu_info?.name || "GPU"
+    : "CPU";
+
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+  // RENDER
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
   return (
-    <div className="space-y-6 text-zinc-200">
-      {highRiskAlert && bannerVisible && (
-        <div className="relative overflow-hidden rounded-lg border border-red-500/40 bg-[#12060c] shadow-[0_0_24px_rgba(255,45,85,0.18)]">
-          <div className="absolute inset-0 opacity-30" style={{ background: "repeating-linear-gradient(90deg, transparent, transparent 12px, rgba(255,45,85,0.15) 12px, rgba(255,45,85,0.15) 18px)" }}></div>
-          <div className="p-4 flex flex-wrap items-center gap-3 relative z-10">
-            <div className="flex items-center gap-2 text-red-400">
-              <AlertTriangle className="w-4 h-4" />
-              <span className="font-mono text-xs uppercase tracking-widest">Critical Alert</span>
-            </div>
-            <div className="text-sm text-zinc-200 flex-1">
-              {highRiskAlert.event_type} @ {highRiskAlert.location || "Unknown"} • {formatTime(highRiskAlert.timestamp)}
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={toggleAlarmMuted}
-                className="px-3 py-1.5 bg-red-500/10 border border-red-400/40 text-red-200 hover:bg-red-500/20 rounded font-mono text-[11px] uppercase tracking-wider transition-all"
-              >
-                <BellOff className="w-3 h-3" /> {alarmMuted ? "Unmute" : "Mute Alarm"}
-              </button>
-              <button
-                onClick={handleDismissBannerAlert}
-                disabled={actionLoading === highRiskAlert.id}
-                className="px-3 py-1.5 bg-transparent border border-red-500/50 text-red-400 hover:bg-red-500/20 hover:shadow-[0_0_15px_rgba(239,68,68,0.3)] rounded font-mono text-[11px] uppercase tracking-wider transition-all disabled:opacity-50"
-              >
-                {actionLoading === highRiskAlert.id ? "..." : "Dismiss"}
-              </button>
-              <button
-                onClick={handleBannerDismiss}
-                className="px-2 py-1.5 text-zinc-500 hover:text-zinc-300 font-mono text-xs transition-all"
-              >
-                ✕
-              </button>
-            </div>
+    <div className="space-y-4 p-1" style={{ color: 'var(--text-primary)' }}>
+      {/* â”€â”€ Critical Alert Banner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      {highRiskAlert && (
+        <div className="panel animate-fade-in" style={{ borderColor: 'var(--danger-border)' }}>
+          <div className="flex items-center gap-3 px-4 py-3" style={{ background: 'var(--danger-dim)' }}>
+            <div className="status-dot status-dot-danger animate-pulse-dot" />
+            <AlertTriangle className="w-4 h-4" style={{ color: 'var(--danger)' }} />
+            <span className="text-xs font-semibold uppercase" style={{ color: 'var(--danger)' }}>
+              Critical Threat Detected
+            </span>
+            <span className="text-sm flex-1" style={{ color: 'var(--text-secondary)' }}>
+              {highRiskAlert.event_type} â€” {highRiskAlert.location || "Unknown"}{" "}
+              â€” {formatTime(highRiskAlert.timestamp)}
+            </span>
+            <button onClick={toggleMute} className="btn btn-danger">
+              <BellOff className="w-3 h-3" />
+              {alarmMuted ? "Unmute" : "Mute"}
+            </button>
+            <button
+              onClick={() => handleDismiss(highRiskAlert.id)}
+              disabled={actionLoading === highRiskAlert.id}
+              className="btn btn-ghost"
+            >
+              Dismiss
+            </button>
           </div>
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-        <div className="lg:col-span-3 space-y-4">
-          <div className="bg-[#071018]/90 border border-[#00e5ff]/25 rounded-lg overflow-hidden shadow-[0_0_28px_rgba(0,229,255,0.12)]">
-            <div className="p-4 border-b border-[#00e5ff]/20 flex items-center justify-between bg-gradient-to-r from-[#071018] via-[#0a1623] to-[#071018]">
-              <div className="flex items-center gap-3">
-                <Video className="w-4 h-4 text-[#00e5ff]" />
-                <span className="text-[#00e5ff] text-sm uppercase tracking-[0.25em]">[ Camera Feed ]</span>
+      <div className="fixed top-4 right-4 z-[9999] space-y-3 w-[340px] max-w-[calc(100vw-2rem)]">
+        {weaponToasts.map((toast) => (
+          <div
+            key={toast.id}
+            className="rounded-lg overflow-hidden animate-slide-in"
+            style={{ background: "var(--bg-panel)", border: "1px solid var(--danger-border)", boxShadow: "0 18px 50px rgba(0,0,0,0.35)" }}
+          >
+            <div className="p-4">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="w-5 h-5 flex-shrink-0" style={{ color: "var(--danger)" }} />
+                <div className="flex-1 min-w-0">
+                  <div className="text-xs font-semibold tracking-wide" style={{ color: "var(--danger)" }}>⚠ WEAPON DETECTED</div>
+                  <div className="text-sm mt-1" style={{ color: "var(--text-primary)" }}>
+                    {toast.weapon_class} - Person ID {toast.person_id}
+                  </div>
+                  <div className="text-xs mt-1" style={{ color: "var(--text-secondary)" }}>
+                    Confidence: {Math.round(toast.confidence * 100)}%
+                  </div>
+                  <div className="text-xs mt-1" style={{ color: "var(--text-muted)" }}>
+                    {toast.location} · {toast.timestamp}
+                  </div>
+                </div>
+                <button type="button" onClick={() => dismissWeaponToast(toast.id)} className="btn btn-ghost" aria-label="Dismiss weapon alert">
+                  <X className="w-3 h-3" />
+                </button>
               </div>
-              <div className="flex items-center gap-2 text-[11px] text-red-400">
-                <div className="w-2 h-2 rounded-full bg-red-500 shadow-[0_0_8px_#ff2d55] animate-pulse"></div>
-                <span className="border border-red-400/50 px-2 py-0.5 rounded uppercase tracking-widest">Live</span>
+            </div>
+            <div className="h-1" style={{ background: "var(--danger-dim)" }}>
+              <div className="h-full weapon-toast-progress" style={{ background: "var(--danger)" }} />
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* â”€â”€ Main Grid: Feed + Side Panels â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+        {/* â”€â”€ LEFT: Camera Feed + Timeline â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+        <div className="lg:col-span-8 space-y-4">
+          {/* Camera Feed */}
+          <div className="panel">
+            <div className="panel-header">
+              <div className="flex items-center gap-2">
+                <Video className="w-4 h-4" style={{ color: 'var(--accent)' }} />
+                <span className="panel-title">Live Feed</span>
+              </div>
+              <div className="flex items-center gap-3">
+                <span
+                  className="badge"
+                  style={{
+                    color: zonePoints.length >= 3 ? "var(--success)" : "var(--text-muted)",
+                    borderColor: zonePoints.length >= 3 ? "rgba(34,197,94,0.3)" : "var(--border-strong)",
+                    background: zonePoints.length >= 3 ? "var(--success-dim)" : "transparent",
+                  }}
+                >
+                  {zonePoints.length >= 3 ? "Zone Active" : "No Zone"}
+                </span>
+                <button
+                  onClick={() => setDrawingZone((prev) => !prev)}
+                  className="btn btn-ghost"
+                  title="Draw detection zone"
+                >
+                  <Pencil className="w-3 h-3" />
+                  {drawingZone ? "Cancel Zone" : "Draw Zone"}
+                </button>
+                {zonePoints.length > 0 && (
+                  <button
+                    onClick={clearZone}
+                    className="btn btn-warning"
+                    disabled={zoneSaving}
+                    title="Clear detection zone"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    Clear Zone
+                  </button>
+                )}
+                <div className="flex items-center gap-1.5">
+                  {wsStatus === "connected" ? (
+                    <Wifi className="w-3 h-3" style={{ color: 'var(--success)' }} />
+                  ) : (
+                    <WifiOff className="w-3 h-3" style={{ color: 'var(--danger)' }} />
+                  )}
+                  <span
+                    className="text-[11px] font-medium"
+                    style={{
+                      color: wsStatus === "connected" ? "var(--success)" : "var(--danger)",
+                    }}
+                  >
+                    {wsStatus === "connected" ? "Connected" : "Offline"}
+                  </span>
+                </div>
               </div>
             </div>
 
-            <div className="relative aspect-video bg-[#050a12]">
-              <div
-                className="absolute inset-0 pointer-events-none z-10 opacity-25"
-                style={{ background: "repeating-linear-gradient(0deg, transparent, transparent 3px, rgba(0,229,255,0.04) 3px, rgba(0,229,255,0.04) 6px)" }}
-              ></div>
-
+            <div
+              className={`relative aspect-video ${drawingZone ? "cursor-crosshair" : ""}`}
+              style={{ background: '#0a0e14' }}
+            >
+              {/* Feed */}
               {currentFeed ? (
                 <img
+                  id="camera-feed"
                   src={currentFeed}
                   alt="Live Camera Feed"
                   className="w-full h-full object-contain"
-                  onError={(e) => {
+                  onError={() => {
                     if (!hasTriedStream.current && streamUrl) {
                       hasTriedStream.current = true;
                       setCurrentFeed(streamUrl);
@@ -359,175 +790,289 @@ export default function LiveMonitor() {
                     startSnapshotFallback();
                   }}
                   onLoad={() => {
-                    if (currentFeed === streamUrl) {
-                      stopSnapshotFallback();
-                    }
+                    if (currentFeed === streamUrl) stopSnapshotFallback();
                   }}
                 />
               ) : (
-                <div className="w-full h-full flex items-center justify-center text-[#00e5ff] text-sm">Loading video feed...</div>
+                <div className="w-full h-full flex items-center justify-center text-sm" style={{ color: 'var(--text-muted)' }}>
+                  Awaiting video signalâ€¦
+                </div>
               )}
 
-              <div className="absolute top-3 left-3 bg-[#071018]/85 border border-[#00e5ff]/40 px-3 py-1 rounded text-[11px] text-[#1de9b6] tracking-widest uppercase">
-                CAM-01 • Main Entrance
+              <ZoneCanvas
+                savedZone={zonePoints}
+                drawing={drawingZone}
+                onComplete={completeZone}
+              />
+
+              {drawingZone && (
+                <div className="absolute left-3 top-3 max-w-xs rounded px-3 py-2 text-[11px]" style={{ background: 'rgba(15,20,25,0.9)', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}>
+                  Click points on the frame. Click near the first point to close and save the polygon.
+                </div>
+              )}
+
+              {/* FPS overlay */}
+              <div className="absolute top-3 right-3 px-2.5 py-1 rounded" style={{ background: 'rgba(15,20,25,0.85)', border: '1px solid var(--border)' }}>
+                <span className="text-[11px] font-mono font-medium" style={{ color: 'var(--success)' }}>
+                  {stats?.pipeline_fps
+                    ? `${stats.pipeline_fps} FPS`
+                    : "â€” FPS"}
+                </span>
               </div>
-              <div className="absolute top-3 right-3 bg-[#071018]/85 border border-red-400/40 px-2 py-1 rounded text-[11px] text-red-400 tracking-widest flex items-center gap-2">
-                <span className="w-2 h-2 rounded-full bg-red-500 shadow-[0_0_8px_#ff2d55] animate-pulse"></span>
-                Live
-              </div>
-              <div className="absolute bottom-3 left-3 right-3">
-                <div className="bg-[#071018]/85 border border-[#00e5ff]/30 p-3 rounded">
-                  <div className="flex items-center justify-between">
-                    <div className="text-[#00e5ff] text-sm uppercase tracking-widest">Resolution 1920x1080 • 30fps</div>
-                    <div className="flex items-center gap-2 text-[11px] text-[#1de9b6]">
-                      <span className="w-2 h-2 rounded-full bg-[#1de9b6] shadow-[0_0_8px_#1de9b6] animate-pulse"></span>
-                      Detecting
-                    </div>
+
+              {/* Bottom info bar */}
+              <div className="absolute bottom-0 left-0 right-0 px-4 py-3" style={{ background: 'linear-gradient(to top, rgba(15,20,25,0.9), transparent)' }}>
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-1.5">
+                    <div className={`status-dot ${stats?.pipeline_running ? "status-dot-success animate-pulse-dot" : "status-dot-danger"}`} />
+                    <span className="text-[11px] font-medium" style={{ color: stats?.pipeline_running ? "var(--success)" : "var(--danger)" }}>
+                      {stats?.pipeline_running ? "AI Active" : "AI Offline"}
+                    </span>
                   </div>
+                  <span className="text-[11px] font-mono" style={{ color: 'var(--text-muted)' }}>
+                    {stats?.pipeline_frames?.toLocaleString() ?? "0"} frames processed
+                  </span>
                 </div>
               </div>
-
-              <div
-                className="absolute inset-0 pointer-events-none"
-                style={{ background: "radial-gradient(circle at 20% 20%, rgba(0,229,255,0.08), transparent 35%), radial-gradient(circle at 80% 30%, rgba(29,233,182,0.06), transparent 40%)" }}
-              ></div>
             </div>
+          </div>
 
-            <div className="border-t border-[#00e5ff]/20 p-4 bg-[#050a12]">
-              <div className="flex items-center gap-2 mb-3">
-                <Activity className="w-4 h-4 text-[#00e5ff]" />
-                <h3 className="text-[#00e5ff] text-xs uppercase tracking-[0.25em]">[ Threat Timeline ]</h3>
+          {/* Threat Timeline */}
+          <div className="panel">
+            <div className="panel-header">
+              <div className="flex items-center gap-2">
+                <Activity className="w-4 h-4" style={{ color: 'var(--accent)' }} />
+                <span className="panel-title">Threat Timeline</span>
               </div>
+              <span className="data-label">
+                {alerts.length} event{alerts.length !== 1 ? "s" : ""}
+              </span>
+            </div>
+            <div className="panel-body">
+              <ThreatTimeline alerts={alerts} />
+            </div>
+          </div>
+
+          {/* Recent Events Table */}
+          <div className="panel">
+            <div className="panel-header">
+              <div className="flex items-center gap-2">
+                <Eye className="w-4 h-4" style={{ color: 'var(--accent)' }} />
+                <span className="panel-title">Recent Events</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="data-label">{activeAlerts.length} active</span>
+                <a
+                  href={`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api'}/alerts/export/csv${getApiToken() ? `?token=${encodeURIComponent(getApiToken()!)}` : ''}`}
+                  download
+                  className="flex items-center gap-1 px-2 py-1 rounded text-xs"
+                  style={{ background: 'var(--accent-dim)', color: 'var(--accent)', border: '1px solid rgba(59,130,246,0.2)' }}
+                  title="Export alerts as CSV"
+                >
+                  <Download className="w-3 h-3" />
+                  CSV
+                </a>
+              </div>
+            </div>
+            <div className="max-h-[260px] overflow-y-auto">
               {loading ? (
-                <div className="space-y-2">
+                <div className="p-4 space-y-2">
                   {[1, 2, 3].map((i) => (
-                    <div key={i} className="animate-pulse flex items-center justify-between p-3 bg-[#071018] border border-[#00e5ff]/10 rounded">
-                      <div className="h-4 bg-zinc-800 rounded w-1/3"></div>
-                      <div className="h-4 bg-zinc-800 rounded w-16"></div>
-                    </div>
+                    <div key={i} className="animate-pulse h-10 rounded" style={{ background: 'var(--bg-primary)' }} />
                   ))}
+                </div>
+              ) : alerts.length === 0 ? (
+                <div className="p-6 text-center text-sm" style={{ color: 'var(--text-muted)' }}>
+                  No events recorded
                 </div>
               ) : (
-                <div className="space-y-2">
-                  {visibleTimelineAlerts.map((event) => (
-                    <div
-                      key={event.id}
-                      onClick={() => handleEventClick(event)}
-                      className="flex items-center justify-between p-3 bg-[#071018] border border-[#00e5ff]/10 rounded text-xs cursor-pointer hover:border-[#00e5ff]/30 hover:bg-[#00e5ff]/5 transition-all"
-                    >
-                      <div className="flex items-center gap-3 flex-1">
-                        <div
-                          className={`w-2 h-2 rounded-full ${event.risk_level?.toLowerCase() === "high"
-                            ? "bg-[#ff2d55] shadow-[0_0_6px_#ff2d55]"
-                            : event.risk_level?.toLowerCase() === "medium"
-                              ? "bg-[#ffc400] shadow-[0_0_6px_#ffc400]"
-                              : "bg-[#1de9b6] shadow-[0_0_6px_#1de9b6]"
-                            }`}
-                        ></div>
-                        <span className="text-[#00e5ff]">{formatTime(event.timestamp)}</span>
-                        <span className="text-zinc-400">{event.event_type}</span>
-                      </div>
-                      <div className={`px-2 py-0.5 border rounded text-[10px] uppercase ${getRiskColor(event.risk_level)}`}>
-                        {event.risk_level?.toUpperCase() || "LOW"}
-                      </div>
-                    </div>
-                  ))}
-                  {alerts.length === 0 && <p className="text-zinc-600 text-xs text-center py-4">// No recent events</p>}
-                  {hasMoreAlerts && (
-                    <button
-                      onClick={() => setShowAllTimeline((s) => !s)}
-                      className="w-full py-2 text-center text-[11px] font-mono text-[#00e5ff]/70 hover:text-[#00e5ff] border border-[#00e5ff]/15 hover:border-[#00e5ff]/30 rounded bg-[#071018] hover:bg-[#00e5ff]/5 transition-all uppercase tracking-wider"
-                    >
-                      {showAllTimeline ? `▲ Show Less` : `▼ Show All (${alerts.length})`}
-                    </button>
-                  )}
-                </div>
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                      <th className="text-left px-3 py-2 table-header">Time</th>
+                      <th className="text-left px-3 py-2 table-header">Event</th>
+                      <th className="text-left px-3 py-2 table-header">Entity</th>
+                      <th className="text-left px-3 py-2 table-header">Severity</th>
+                      <th className="text-left px-3 py-2 table-header">Score</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {alerts.slice(0, 15).map((a) => (
+                      <tr
+                        key={a.id}
+                        className="transition-colors"
+                        style={{ borderBottom: '1px solid var(--border)' }}
+                        onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.02)'; }}
+                        onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+                      >
+                        <td className="px-3 py-2 font-mono text-[11px]" style={{ color: 'var(--accent)' }}>
+                          {formatTime(a.timestamp)}
+                        </td>
+                        <td className="px-3 py-2" style={{ color: 'var(--text-primary)' }}>
+                          {a.event_type}
+                        </td>
+                        <td className="px-3 py-2 font-mono" style={{ color: 'var(--text-secondary)' }}>
+                          {a.person_id || "â€”"}
+                        </td>
+                        <td className="px-3 py-2">
+                          <span className={getBadgeClass(a.risk_level)}>
+                            {a.risk_level?.toUpperCase() || "LOW"}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 font-mono" style={{ color: 'var(--text-secondary)' }}>
+                          {(a.risk_score ?? 0).toFixed(2)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               )}
             </div>
           </div>
         </div>
 
-        <div className="space-y-6">
-          <div className="bg-[#071018]/90 border border-[#ff2d55]/30 rounded-lg overflow-hidden shadow-[0_0_24px_rgba(255,45,85,0.18)]">
-            <div className="p-4 border-b border-[#ff2d55]/30 flex items-center justify-between bg-[#12060c]">
+        {/* â”€â”€ RIGHT: Alert Stack + Metrics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+        <div className="lg:col-span-4 space-y-4">
+          {/* System Metrics */}
+          <div className="panel">
+            <div className="panel-header">
               <div className="flex items-center gap-2">
-                <AlertTriangle className="w-4 h-4 text-[#ff2d55]" />
-                <h3 className="text-[#ff2d55] text-xs uppercase tracking-[0.25em]">[ Alert Stack ]</h3>
+                <Gauge className="w-4 h-4" style={{ color: 'var(--accent)' }} />
+                <span className="panel-title">System Metrics</span>
               </div>
-              <span className="text-[#ff2d55] text-sm font-bold">{activeAlerts.length}</span>
             </div>
-            {/* Clear Resolved button */}
-            <div className="px-4 pt-3 pb-1 border-b border-[#ff2d55]/15">
+            <div className="panel-body space-y-2">
+              <MetricCard
+                label="Pipeline FPS"
+                value={stats?.pipeline_fps != null ? `${stats.pipeline_fps}` : "â€”"}
+                color="var(--success)"
+                icon={Zap}
+              />
+              <MetricCard
+                label="Frame Latency"
+                value={
+                  stats?.last_frame_age_s != null
+                    ? `${stats.last_frame_age_s}s`
+                    : "â€”"
+                }
+                color="var(--warning)"
+                icon={Clock}
+              />
+              <MetricCard
+                label="Active Tracks"
+                value={`${stats?.active_tracks ?? 0}`}
+                color="var(--accent)"
+                icon={Eye}
+              />
+              <MetricCard
+                label="Device"
+                value={deviceLabel}
+                color="var(--success)"
+                icon={Cpu}
+              />
+              <MetricCard
+                label="Pipeline"
+                value={stats?.pipeline_running ? "Running" : "Offline"}
+                color={
+                  stats?.pipeline_running
+                    ? "var(--success)"
+                    : "var(--danger)"
+                }
+                icon={Monitor}
+              />
+            </div>
+          </div>
+
+          {/* Active Alert Stack */}
+          <div className="panel" style={{ borderColor: activeAlerts.length > 0 ? 'var(--danger-border)' : undefined }}>
+            <div className="panel-header" style={{ background: activeAlerts.length > 0 ? 'var(--danger-dim)' : undefined }}>
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4" style={{ color: activeAlerts.length > 0 ? 'var(--danger)' : 'var(--text-muted)' }} />
+                <span className="panel-title" style={{ color: activeAlerts.length > 0 ? 'var(--danger)' : undefined }}>
+                  Active Alerts
+                </span>
+              </div>
+              <span className="data-value" style={{ color: 'var(--danger)', fontSize: 14 }}>
+                {activeAlerts.length}
+              </span>
+            </div>
+
+            {/* Bulk dismiss */}
+            <div className="px-3 py-2" style={{ borderBottom: '1px solid var(--border)' }}>
               <button
                 onClick={handleBulkDismiss}
                 disabled={bulkDismissing || activeAlerts.length === 0}
-                className="w-full py-1.5 text-center text-[10px] font-mono uppercase tracking-wider border border-zinc-700 text-zinc-400 hover:text-red-400 hover:border-red-500/40 hover:bg-red-500/10 rounded transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                className="btn btn-ghost w-full justify-center py-1.5"
               >
-                {bulkDismissing ? "Clearing..." : "⊘ Clear All Alerts"}
+                {bulkDismissing ? "Clearingâ€¦" : "Clear All"}
               </button>
             </div>
-            <div className="p-4 space-y-3 max-h-[420px] overflow-y-auto">
-              {activeAlerts.length === 0 && <p className="text-zinc-600 text-xs text-center py-4">// No active alerts</p>}
+
+            {/* Alert list */}
+            <div className="max-h-[480px] overflow-y-auto">
+              {activeAlerts.length === 0 && (
+                <div className="p-6 text-center text-sm" style={{ color: 'var(--text-muted)' }}>
+                  No active threats
+                </div>
+              )}
               {activeAlerts.map((alert) => {
-                const risk = (alert.risk_level || "").toLowerCase();
-                const pulse = risk === "high" || risk === "critical" ? "animate-pulse" : "";
+                const isHighRisk =
+                  alert.risk_level?.toLowerCase() === "high" ||
+                  alert.risk_level?.toLowerCase() === "critical";
                 return (
                   <div
                     key={alert.id}
-                    className={`p-3 bg-[#0b0f18] border ${risk === "high" || risk === "critical"
-                      ? "border-[#ff2d55]/50 shadow-[0_0_14px_rgba(255,45,85,0.22)]"
-                      : "border-[#00e5ff]/20"
-                      } rounded transition-all`}
+                    className="p-3 transition-colors animate-fade-in"
+                    style={{
+                      borderBottom: '1px solid var(--border)',
+                      background: isHighRisk ? 'var(--danger-dim)' : 'transparent',
+                    }}
                   >
-                    <div className="flex items-start justify-between mb-2">
+                    <div className="flex items-start justify-between mb-1.5">
                       <div className="flex items-center gap-2">
-                        <div
-                          className={`w-2 h-2 rounded-full ${pulse} ${risk === "high" || risk === "critical"
-                            ? "bg-[#ff2d55]"
-                            : risk === "medium"
-                              ? "bg-[#ffc400]"
-                              : "bg-[#1de9b6]"
-                            }`}
-                        ></div>
-                        <div className="text-[10px] text-zinc-400 uppercase tracking-widest">{alert.camera_id || "CAM-01"}</div>
+                        <div className={`status-dot ${isHighRisk ? "status-dot-danger animate-pulse-dot" : alert.risk_level?.toLowerCase() === "medium" ? "status-dot-warning" : "status-dot-success"}`} />
+                        <span className="data-label">
+                          {alert.camera_id || "CAM-01"}
+                        </span>
                       </div>
-                      <div className={`text-[10px] px-2 py-0.5 border rounded uppercase ${getRiskColor(alert.risk_level)}`}>
-                        {alert.risk_level?.toUpperCase()}
-                      </div>
+                      <span className={getBadgeClass(alert.risk_level)}>
+                        {alert.risk_level?.toUpperCase() || "LOW"}
+                      </span>
                     </div>
-                    <div className="text-[#00e5ff] text-sm font-semibold mb-1">{alert.event_type}</div>
-                    <div className="text-[11px] text-zinc-400 mb-2">
-                      Confidence: {(alert.risk_score ?? 0).toFixed(2)} • Camera: {alert.camera_id || "CAM-01"} • {formatTime(alert.timestamp)}
+
+                    <div className="text-sm font-medium mb-1" style={{ color: 'var(--text-primary)' }}>
+                      {alert.event_type}
                     </div>
-                    <div className="pt-2 border-t border-[#00e5ff]/10 flex flex-wrap gap-2">
-                      <button
-                        onClick={() => handleReviewAlert(alert)}
-                        className="px-2 py-1 bg-[#00e5ff]/10 border border-[#00e5ff]/40 text-[#00e5ff] hover:bg-[#00e5ff]/20 rounded text-[10px] uppercase tracking-wider transition-all"
-                      >
-                        Review
-                      </button>
+                    <div className="data-label mb-2">
+                      Score: {(alert.risk_score ?? 0).toFixed(2)} Â· {formatTime(alert.timestamp)}
+                    </div>
+
+                    {/* Action buttons */}
+                    <div className="flex gap-1.5 pt-1.5" style={{ borderTop: '1px solid var(--border)' }}>
                       {alert.status?.toLowerCase() === "active" && (
                         <button
-                          onClick={() => handleAcknowledgeAlert(alert.id)}
+                          onClick={() => handleAck(alert.id)}
                           disabled={actionLoading === alert.id}
-                          className="px-2 py-1 bg-[#ffc400]/10 border border-[#ffc400]/40 text-[#ffc400] hover:bg-[#ffc400]/20 rounded text-[10px] uppercase tracking-wider transition-all disabled:opacity-50"
+                          className="btn btn-warning"
                         >
-                          {actionLoading === alert.id ? "..." : "Ack"}
+                          Acknowledge
                         </button>
                       )}
                       <button
-                        onClick={() => handleResolveAlert(alert.id)}
+                        onClick={() => handleResolve(alert.id)}
                         disabled={actionLoading === alert.id}
-                        className="px-2 py-1 bg-[#1de9b6]/10 border border-[#1de9b6]/40 text-[#1de9b6] hover:bg-[#1de9b6]/20 rounded text-[10px] uppercase tracking-wider transition-all disabled:opacity-50"
+                        className="btn btn-success"
                       >
-                        {actionLoading === alert.id ? "..." : "Resolve"}
+                        <Check className="w-3 h-3" />
+                        Resolve
                       </button>
                       <button
-                        onClick={() => handleDismissAlert(alert.id)}
+                        onClick={() => handleDismiss(alert.id)}
                         disabled={actionLoading === alert.id}
-                        className="px-2 py-1 bg-zinc-800 border border-zinc-600 text-zinc-300 hover:border-zinc-400 rounded text-[10px] uppercase tracking-wider transition-all disabled:opacity-50"
+                        className="btn btn-ghost"
                       >
-                        {actionLoading === alert.id ? "..." : "Dismiss"}
+                        <X className="w-3 h-3" />
+                        Dismiss
                       </button>
                     </div>
                   </div>
@@ -536,166 +1081,34 @@ export default function LiveMonitor() {
             </div>
           </div>
 
-          <div className="bg-[#071018]/90 border border-[#00e5ff]/25 rounded-lg p-4 space-y-4 shadow-[0_0_18px_rgba(0,229,255,0.12)]">
-            <div className="flex items-center justify-between">
-              <h3 className="text-[#00e5ff] text-xs uppercase tracking-[0.25em]">[ Threat Radar ]</h3>
-              <span className="text-[11px] text-zinc-500">blips = detections</span>
+          {/* Operations Summary */}
+          <div className="panel">
+            <div className="panel-header">
+              <span className="panel-title">Operations Summary</span>
             </div>
-            <div className="relative w-full aspect-square bg-gradient-to-br from-[#050a12] to-[#0a1623] border border-[#00e5ff]/20 rounded-full overflow-hidden">
-              <svg viewBox="0 0 100 100" className="absolute inset-0">
-                <circle cx="50" cy="50" r="48" stroke="#00e5ff22" strokeWidth="0.6" fill="none" />
-                <circle cx="50" cy="50" r="32" stroke="#00e5ff18" strokeWidth="0.6" fill="none" />
-                <circle cx="50" cy="50" r="16" stroke="#00e5ff12" strokeWidth="0.6" fill="none" />
-                <line x1="50" y1="0" x2="50" y2="100" stroke="#00e5ff15" strokeWidth="0.4" />
-                <line x1="0" y1="50" x2="100" y2="50" stroke="#00e5ff15" strokeWidth="0.4" />
-                {radarBlips.map((b) => (
-                  <circle key={b.id} cx={b.cx} cy={b.cy} r="2" fill={b.color} opacity="0.9" />
-                ))}
-              </svg>
-              <div className="absolute inset-0 animate-spin-slow" style={{ background: "conic-gradient(from 90deg, transparent 60%, rgba(0,229,255,0.25) 100%)" }}></div>
-              <div className="absolute inset-0 flex items-center justify-center">
-                <div className="w-3 h-3 rounded-full bg-[#00e5ff] shadow-[0_0_12px_rgba(0,229,255,0.6)]"></div>
+            <div className="panel-body space-y-2">
+              <div className="flex items-center justify-between rounded-md px-3 py-2" style={{ background: 'var(--bg-primary)', border: '1px solid var(--border)' }}>
+                <span className="data-label">Total Alerts</span>
+                <span className="data-value" style={{ color: 'var(--accent)' }}>
+                  {stats?.total_alerts ?? "â€”"}
+                </span>
               </div>
-            </div>
-          </div>
-
-          <div className="bg-[#071018]/90 border border-[#00e5ff]/25 rounded-lg p-4 shadow-[0_0_18px_rgba(0,229,255,0.12)]">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-[#00e5ff] text-xs uppercase tracking-[0.25em]">[ Threat Risk ]</h3>
-              <span className="text-[11px] text-zinc-400">{riskLabel}</span>
-            </div>
-            <div className="flex items-center gap-4">
-              <div className="h-36 w-10 bg-[#050a12] border border-[#00e5ff]/25 rounded relative overflow-hidden">
-                <div className="absolute inset-0 bg-gradient-to-t from-[#ff2d55]/70 via-[#ffc400]/60 to-[#1de9b6]/50 opacity-70"></div>
-                <div className="absolute bottom-0 left-0 right-0" style={{ height: `${riskPercent}%`, background: "linear-gradient(180deg, #ff2d55, #ffc400)" }}></div>
+              <div className="flex items-center justify-between rounded-md px-3 py-2" style={{ background: 'var(--bg-primary)', border: '1px solid rgba(245, 158, 11, 0.15)' }}>
+                <span className="data-label">Active Incidents</span>
+                <span className="data-value" style={{ color: 'var(--warning)' }}>
+                  {stats?.active_incidents ?? "â€”"}
+                </span>
               </div>
-              <div>
-                <div className="text-3xl font-bold text-[#00e5ff]">{riskPercent}%</div>
-                <div className="text-[11px] text-zinc-400">Threat Level</div>
+              <div className="flex items-center justify-between rounded-md px-3 py-2" style={{ background: 'var(--bg-primary)', border: '1px solid var(--danger-border)' }}>
+                <span className="data-label">High Risk</span>
+                <span className="data-value" style={{ color: 'var(--danger)' }}>
+                  {stats?.high_risk_alerts ?? "â€”"}
+                </span>
               </div>
-            </div>
-          </div>
-
-          <div className="bg-[#071018]/90 border border-[#00e5ff]/25 rounded-lg p-4 space-y-3 shadow-[0_0_18px_rgba(0,229,255,0.12)]">
-            <div className="flex items-center gap-2">
-              <Gauge className="w-4 h-4 text-[#00e5ff]" />
-              <h3 className="text-[#00e5ff] text-xs uppercase tracking-[0.25em]">[ System Telemetry ]</h3>
-            </div>
-            <div className="space-y-2 text-sm text-zinc-300">
-              <MetricBar label="Pipeline FPS" value={stats?.pipeline_fps != null ? `${stats.pipeline_fps} fps` : "—"} color="#1de9b6" />
-              <MetricBar label="Frame Latency" value={stats?.last_frame_age_s != null ? `${stats.last_frame_age_s}s ago` : "—"} color="#ffc400" />
-              <MetricBar label="Active Tracks" value={`${stats?.active_tracks ?? activeAlerts.length}`} color="#00e5ff" />
-              <MetricBar label="Pipeline" value={stats?.pipeline_running ? "Running" : "Offline"} color={stats?.pipeline_running ? "#1de9b6" : "#ff2d55"} compact />
             </div>
           </div>
         </div>
       </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-        <div className="lg:col-span-3">
-          <div className="bg-[#0b0f18]/90 border border-[#00e5ff]/20 rounded-lg p-4">
-            <div className="flex items-center gap-2 mb-2">
-              <Waves className="w-4 h-4 text-[#00e5ff]" />
-              <h3 className="text-[#00e5ff] text-xs uppercase tracking-[0.25em]">[ Operations Board ]</h3>
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              <div className="bg-[#050a12] border border-[#00e5ff]/15 rounded p-3 flex items-center justify-between">
-                <span className="text-[11px] uppercase tracking-widest text-zinc-400">Total Alerts</span>
-                <span className="text-[#00e5ff] text-lg font-semibold">{stats?.total_alerts ?? "—"}</span>
-              </div>
-              <div className="bg-[#050a12] border border-[#ffc400]/25 rounded p-3 flex items-center justify-between">
-                <span className="text-[11px] uppercase tracking-widest text-zinc-400">Active Incidents</span>
-                <span className="text-[#ffc400] text-lg font-semibold">{stats?.active_incidents ?? "—"}</span>
-              </div>
-              <div className="bg-[#050a12] border border-[#ff2d55]/25 rounded p-3 flex items-center justify-between">
-                <span className="text-[11px] uppercase tracking-widest text-zinc-400">High Risk</span>
-                <span className="text-[#ff2d55] text-lg font-semibold">{stats?.high_risk_alerts ?? "—"}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div className="bg-[#0b0f18]/90 border border-[#00e5ff]/20 rounded-lg p-4">
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="text-[#00e5ff] text-xs uppercase tracking-[0.25em]">[ Quick Actions ]</h3>
-            <button
-              onClick={() => router.refresh()}
-              className="text-[11px] text-[#1de9b6] border border-[#1de9b6]/40 px-2 py-1 rounded uppercase tracking-wider hover:bg-[#1de9b6]/10"
-            >
-              Refresh
-            </button>
-          </div>
-          <div className="space-y-2 text-sm text-zinc-300">
-            <div className="flex items-center justify-between bg-[#050a12] border border-[#00e5ff]/15 rounded px-3 py-2">
-              <span className="text-[11px] uppercase tracking-widest text-zinc-400">Pipeline</span>
-              <span className={`text-xs ${stats?.pipeline_running ? 'text-[#1de9b6]' : 'text-[#ff2d55]'}`}>{stats?.pipeline_running ? 'Active' : 'Offline'}</span>
-            </div>
-            <div className="flex items-center justify-between bg-[#050a12] border border-[#ffc400]/15 rounded px-3 py-2">
-              <span className="text-[11px] uppercase tracking-widest text-zinc-400">Total Frames</span>
-              <span className="text-[#ffc400] text-xs">{stats?.pipeline_frames?.toLocaleString() ?? '—'}</span>
-            </div>
-            <div className="flex items-center justify-between bg-[#050a12] border border-[#1de9b6]/15 rounded px-3 py-2">
-              <span className="text-[11px] uppercase tracking-widest text-zinc-400">High Risk</span>
-              <span className="text-[#ff2d55] text-xs">{stats?.high_risk_alerts ?? '—'}</span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {replayAlert && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-6">
-          <div className="bg-[#0a0a0c] border border-[#00e5ff]/30 rounded-xl w-full max-w-5xl shadow-[0_0_30px_rgba(0,229,255,0.15)] relative">
-            <div className="flex items-center justify-between px-6 py-4 border-b border-[#00e5ff]/20">
-              <div>
-                <p className="text-[#00e5ff] font-mono text-xs uppercase tracking-widest">Incident Replay</p>
-                <p className="text-zinc-400 text-sm font-mono">
-                  {replayAlert.event_type} @ {replayAlert.location || "Unknown"}
-                </p>
-              </div>
-              <button onClick={() => setReplayAlert(null)} className="text-zinc-400 hover:text-white font-mono text-sm">
-                Close ✕
-              </button>
-            </div>
-
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 p-6">
-              <div className="lg:col-span-2 bg-black/60 border border-[#00e5ff]/20 rounded-lg p-4">
-                <div className="flex items-center gap-2 mb-3">
-                  <Play className="w-4 h-4 text-[#00e5ff]" />
-                  <p className="text-[#00e5ff] font-mono text-xs uppercase tracking-widest">Replay Sequence (last 10s)</p>
-                </div>
-                <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-                  {replayFrames.map((frame) => (
-                    <div key={frame.id} className="border border-[#00e5ff]/20 rounded bg-black/50 p-2">
-                      <div className="relative aspect-video bg-[#0f172a] overflow-hidden">
-                        {streamUrl ? (
-                          <img src={streamUrl} alt="Replay frame" className="w-full h-full object-contain" />
-                        ) : (
-                          <div className="w-full h-full flex items-center justify-center text-zinc-600 font-mono text-xs">Frame</div>
-                        )}
-                        <div className="absolute bottom-1 left-1 px-2 py-0.5 bg-black/70 border border-[#00e5ff]/30 rounded text-[10px] font-mono text-[#00e5ff]">{frame.timestamp}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div className="bg-black/60 border border-[#00e5ff]/20 rounded-lg p-4 space-y-3">
-                <p className="text-[#00e5ff] font-mono text-xs uppercase tracking-widest">Details</p>
-                <div className="text-zinc-300 text-sm font-mono space-y-1">
-                  <p>Person ID: {replayAlert.person_id || "N/A"}</p>
-                  <p>Camera: {replayAlert.camera_id || "CAM-01"}</p>
-                  <p>Risk: {replayAlert.risk_level?.toUpperCase()}</p>
-                  <p>Timestamp: {formatTime(replayAlert.timestamp)}</p>
-                </div>
-                <div className="space-y-2 text-zinc-400 text-xs font-mono">
-                  <p>// Playback uses recent frame buffer. Full forensic export available in archives.</p>
-                  <p>// Bounding boxes overlay pending data feed.</p>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

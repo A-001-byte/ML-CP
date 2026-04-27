@@ -4,11 +4,15 @@ import { useState, useEffect, useCallback } from 'react';
 import { Search, UserPlus, Edit, Trash2, X, AlertTriangle } from 'lucide-react';
 import { getUsers, createUser, updateUser, deleteUser } from '@/lib/api';
 
+type Role = "admin" | "operator" | "viewer" | "security";
+
+type Status = "Active" | "Inactive";
+
 interface User {
   id: number;
   username: string;
-  role: string;
-  status: string;
+  role: Role;
+  status: Status;
   last_active: string;
 }
 
@@ -50,8 +54,8 @@ export default function UserManagement() {
   // Form states
   const [formUsername, setFormUsername] = useState('');
   const [formPassword, setFormPassword] = useState('');
-  const [formRole, setFormRole] = useState('viewer');
-  const [formStatus, setFormStatus] = useState('Active');
+  const [formRole, setFormRole] = useState<Role>('viewer');
+  const [formStatus, setFormStatus] = useState<Status>('Active');
 
   const fetchUsers = useCallback(async () => {
     try {
@@ -98,7 +102,7 @@ export default function UserManagement() {
     if (!selectedUser) return;
     setActionLoading(true);
     try {
-      const updateData: { username?: string; password?: string; role?: string; status?: string } = {
+      const updateData: { username?: string; password?: string; role?: Role; status?: Status } = {
         username: formUsername,
         role: formRole,
         status: formStatus,
@@ -329,7 +333,7 @@ export default function UserManagement() {
                 <label className="text-[#00e5ff]/60 text-[10px] font-mono uppercase tracking-wider block mb-1">ROLE</label>
                 <select
                   value={formRole}
-                  onChange={(e) => setFormRole(e.target.value)}
+                  onChange={(e) => setFormRole(e.target.value as Role)}
                   className="w-full bg-black/40 border border-[#00e5ff]/30 text-[#00e5ff] font-mono text-sm h-9 px-3 rounded focus:outline-none focus:border-[#00e5ff] appearance-none cursor-pointer"
                 >
                   <option value="viewer">VIEWER</option>
@@ -392,7 +396,7 @@ export default function UserManagement() {
                 <label className="text-[#00e5ff]/60 text-[10px] font-mono uppercase tracking-wider block mb-1">ROLE</label>
                 <select
                   value={formRole}
-                  onChange={(e) => setFormRole(e.target.value)}
+                  onChange={(e) => setFormRole(e.target.value as Role)}
                   className="w-full bg-black/40 border border-[#00e5ff]/30 text-[#00e5ff] font-mono text-sm h-9 px-3 rounded focus:outline-none focus:border-[#00e5ff] appearance-none cursor-pointer"
                 >
                   <option value="viewer">VIEWER</option>
@@ -404,7 +408,7 @@ export default function UserManagement() {
                 <label className="text-[#00e5ff]/60 text-[10px] font-mono uppercase tracking-wider block mb-1">STATUS</label>
                 <select
                   value={formStatus}
-                  onChange={(e) => setFormStatus(e.target.value)}
+                  onChange={(e) => setFormStatus(e.target.value as Status)}
                   className="w-full bg-black/40 border border-[#00e5ff]/30 text-[#00e5ff] font-mono text-sm h-9 px-3 rounded focus:outline-none focus:border-[#00e5ff] appearance-none cursor-pointer"
                 >
                   <option value="Active">ACTIVE</option>

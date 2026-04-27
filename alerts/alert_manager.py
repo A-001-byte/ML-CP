@@ -15,6 +15,13 @@ except ImportError:
     db_add_alert = None
     db_add_incident = None
 
+# Import WebSocket event emitters
+try:
+    from backend.ws_manager import ws_manager
+    WS_AVAILABLE = True
+except ImportError:
+    WS_AVAILABLE = False
+
 
 def normalize_risk_score(raw_score: float) -> float:
     """Normalize risk score to 0.0-1.0 range.
@@ -61,6 +68,7 @@ class AlertManager:
         self.rules = AlertRules()
         self.alert_log: List[Dict[str, Any]] = []
         self.camera_id = camera_id
+        self.location = "Main Entrance"
         # Throttle tracking: key = (person_id, behavior_key) -> last_alert_time
         self._throttle_cache: Dict[tuple, float] = {}
 
@@ -116,6 +124,10 @@ class AlertManager:
         }
         
         self.alert_log.append(alert)
+
+        # Notify via WebSocket if available
+        if WS_AVAILABLE:
+            ws_manager.broadcast_alert(alert)
         
         # Persist to database if available
         if DB_AVAILABLE and db_add_alert is not None:
@@ -149,14 +161,28 @@ class AlertManager:
 
                 # Promote high-priority detections to incidents
                 if db_add_incident is not None and risk_level in ("high", "critical"):
-                    db_add_incident(
+                    incident_id = db_add_incident(
                         title=f"{event_type}: ID {decision['person_id']}",
                         description=f"Automated incident for {decision['person_id']}. Reasons: {', '.join(decision.get('reasons', []))}",
                         event_type=event_type,
-                        location="Main Entrance",  # Could be dynamic if configured
+                        location=self.location,
                         risk_level=risk_level,
                         status="open"
                     )
+                    # Push incident over WebSocket
+                    if WS_AVAILABLE:
+                        ws_manager.broadcast_incident({
+                            "id": incident_id,
+                            "title": f"{event_type}: ID {decision['person_id']}",
+                            "description": f"Automated incident for {decision['person_id']}. Reasons: {', '.join(decision.get('reasons', []))}",
+                            "event_type": event_type,
+                            "location": self.location,
+                            "risk_level": risk_level,
+                            "status": "Open",
+                            "person_id": str(decision["person_id"]),
+                            "camera_id": self.camera_id,
+                        })
+
             except Exception:
                 logger.exception("Failed to persist alert/incident to DB")
         
