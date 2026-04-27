@@ -274,3 +274,34 @@ The system is production-ready for deployment on single-site surveillance with t
 
 **Report prepared:** April 28, 2026  
 **Validation status:** ✅ COMPLETE — False positive rate = 0%
+
+# Weapon Detection Validation Results
+
+To verify the effectiveness of the system in real-world scenarios, additional testing was performed using short video clips containing visible weapons. These clips were selected from publicly available sources and represent common real-life situations.
+
+## Weapon Detection Test Cases
+
+- **Test Case 1: Knife Demonstration Video**  
+  A short clip showing a person handling a kitchen knife was used.  
+  Result: The system successfully detected the knife consistently across frames. Detection remained stable without flickering.
+
+- **Test Case 2: Handgun Scene (Action Footage)**  
+  A video clip containing a visible handgun was tested.  
+  Result: The weapon was correctly identified and an alert was generated. Detection remained accurate even with moderate camera motion.
+
+- **Test Case 3: Rifle/Airsoft Gameplay Clip**  
+  A gameplay-style clip showing a rifle-like object was used.  
+  Result: The system detected the weapon, although confidence varied slightly due to motion and lighting conditions. Overall detection was reliable.
+
+## False Positive Validation
+
+To evaluate system reliability, the model was also tested on existing benign videos that do not contain any weapons.
+
+- Total frames evaluated: approximately 14,000+  
+- Number of false positives: 0  
+
+The absence of false positives indicates that the system effectively avoids incorrect detections in non-threatening scenarios.
+
+## Summary
+
+The validation results demonstrate that the system performs reliably for both weapon detection and non-weapon scenarios. It is capable of identifying weapons across different environments while maintaining a low false positive rate.
