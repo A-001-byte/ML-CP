@@ -1110,3 +1110,65 @@ docker compose up --build
 **Report compiled:** April 28, 2026  
 **Report version:** 1.0 (Submission-Ready)  
 **Prepared by:** ThreatSense-AI Development Team
+
+## Quantitative Results Table
+
+| Class  | Precision | Recall | mAP50 | mAP50-95 |
+|--------|----------|--------|-------|----------|
+| gun    | 0.895    | 0.877  | 0.918 | 0.617    |
+| knife  | 0.860    | 0.947  | 0.948 | 0.704    |
+| person | 0.754    | 0.776  | 0.798 | 0.602    |
+| all    | 0.837    | 0.867  | 0.892 | 0.658    |
+
+The table above demonstrates the model's robust performance across both weapon classes. The high recall for knives indicates strong sensitivity, while the precision for guns ensures a low rate of false alarms, which is critical for real-world deployment.
+
+## Confusion Matrix Section
+
+![Confusion Matrix](docs/evaluation/eval/confusion_matrix_normalized.png)
+
+The confusion matrix highlights a high proportion of true positives for both guns and knives. Minor misclassifications occur primarily when textured backgrounds mimic weapon shapes. The person class, while intentionally downweighted, shows occasional overlap with weapons when bounding boxes are tightly coupled, emphasizing the necessity of our zone-based cropping strategy to isolate the threat.
+
+## False Positive Analysis
+
+During validation, false positives were primarily triggered by complex background features. Textured backgrounds such as curtains, as well as reflections on glass surfaces and unusual lighting artifacts, occasionally mimicked weapon shapes. The implementation of zone-based lower-body cropping significantly reduced these occurrences by excluding upper-body distractors. Remaining edge cases include realistic toy guns and extreme occlusions under low-light conditions.
+
+## Security Analysis
+
+The platform implements robust session management by replacing `localStorage` JWTs—which are vulnerable to cross-site scripting (XSS) attacks—with `HttpOnly` cookies. This ensures that session tokens cannot be accessed via client-side JavaScript, substantially reducing the risk of token theft and session hijacking.
+
+## Test Coverage
+
+The system is validated by a comprehensive suite of 65 automated tests, covering both unit-level behavior and end-to-end integration scenarios. This ensures that core AI logic and API endpoints function correctly under typical loads, with tests executed automatically via the CI pipeline on every push.
+
+## Appendix
+
+### 1. API Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/login` | POST | Authenticate user and set JWT cookie |
+| `/api/stats` | GET | Retrieve system health and active persons |
+| `/api/alerts` | GET | List alerts, filtered by status/date |
+| `/api/incidents` | GET | Retrieve incident history |
+
+### 2. Database Schema
+
+- **alerts**: stores alert history (id, person_id, risk_score, threat_level, behaviors, timestamp, status)
+- **incidents**: stores video evidence references (id, person_id, clip_path, timestamp, status)
+- **users**: stores user credentials and RBAC roles (id, username, password_hash, role)
+
+### 3. Environment Variables
+
+Variables required to run the system (from `.env.example`):
+- `JWT_SECRET`: Secret key for signing tokens
+- `ADMIN_PASSWORD`: Default admin password
+- `DEVICE`: Torch device (`cuda` or `cpu`)
+- `DATABASE_URL`: SQLite connection string
+- `TRUSTED_DASHBOARD_HOSTS`: CORS allowed origins
+
+## Docker Notes
+
+The system supports containerized deployment, and `docker compose up --build` works out of the box for both the backend and frontend. Potential issues to watch out for include:
+- **Model path**: Ensure `models/weapon_detector.pt` is correctly placed or mapped before building.
+- **Volume mount**: Check that `logs/incidents/` is mounted persistently to avoid losing video evidence on container restart.
+- **Ports**: Verify that ports `5000` (backend) and `3000` (dashboard) are not already bound on the host machine.
