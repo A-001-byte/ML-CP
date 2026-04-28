@@ -969,3 +969,41 @@ async def delete_user(
     conn.close()
 
     return {"message": "User deactivated", "id": user_id}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FOOTAGE & PIPELINE CONTROL
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/footage")
+async def get_footage(_user: dict = Depends(get_current_user)):
+    footage_dir = PROJECT_ROOT / "footage"
+    files = []
+    if footage_dir.exists():
+        files = [f.name for f in footage_dir.glob("*.mp4")]
+    
+    sources = [
+        {"label": "Webcam", "value": "0"},
+        {"label": "RTSP Stream", "value": "rtsp://localhost:8554/stream"}
+    ]
+    for f in files:
+        sources.append({"label": f"Footage: {f}", "value": f"footage/{f}"})
+        
+    return {"files": files, "sources": sources}
+
+
+class SwitchSourceRequest(BaseModel):
+    source: str
+
+@router.post("/pipeline/switch_source")
+async def switch_pipeline_source(
+    body: SwitchSourceRequest,
+    _user: dict = Depends(require_roles("admin", "security", "operator"))
+):
+    source = body.source.strip()
+    if not source:
+        raise HTTPException(status_code=400, detail="Source cannot be empty")
+        
+    # In a real system, this would signal the pipeline thread to restart with the new source.
+    return {"message": "Pipeline source switch requested", "source": source}
+

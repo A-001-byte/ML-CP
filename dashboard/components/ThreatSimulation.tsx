@@ -34,6 +34,34 @@ interface AlertEntry {
   radius: number;
 }
 
+function isPointInZone(
+  pxNorm: number,
+  pyNorm: number,
+  src: SimPoint | null,
+  mode: SimMode,
+  radius: number
+): boolean {
+  if (!src || mode === "idle" || radius <= 0) return false;
+  const dx = pxNorm - src.x;
+  const dy = pyNorm - src.y;
+  return Math.sqrt(dx * dx + dy * dy) <= radius;
+}
+
+function getPersonsInZone(count: number, src: SimPoint | null, mode: SimMode, radius: number): number {
+  if (count <= 0 || !src || mode === "idle" || radius <= 0) return 0;
+  let inZoneCount = 0;
+  const seed = [0.18, 0.72, 0.45, 0.91, 0.33, 0.61, 0.08, 0.55, 0.79, 0.27];
+  const seedY = [0.25, 0.65, 0.42, 0.80, 0.15, 0.58, 0.35, 0.72, 0.50, 0.88];
+  for (let i = 0; i < count; i++) {
+    const pxNorm = seed[i % seed.length];
+    const pyNorm = seedY[i % seedY.length];
+    if (isPointInZone(pxNorm, pyNorm, src, mode, radius)) {
+      inZoneCount++;
+    }
+  }
+  return inZoneCount;
+}
+
 // ── Drawing helpers ───────────────────────────────────────────────────────────
 
 function drawGrid(ctx: CanvasRenderingContext2D, w: number, h: number) {
@@ -166,16 +194,12 @@ function drawPersonMarkers(
   const seedY = [0.25, 0.65, 0.42, 0.80, 0.15, 0.58, 0.35, 0.72, 0.50, 0.88];
 
   for (let i = 0; i < Math.min(count, 10); i++) {
-    const px = seed[i % seed.length] * w;
-    const py = seedY[i % seedY.length] * h;
+    const pxNorm = seed[i % seed.length];
+    const pyNorm = seedY[i % seedY.length];
+    const px = pxNorm * w;
+    const py = pyNorm * h;
 
-    let inZone = false;
-    if (src && mode !== "idle" && radius > 0) {
-      const dx = (px / w) - src.x;
-      const dy = (py / h) - src.y;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      inZone = dist <= radius;
-    }
+    const inZone = isPointInZone(pxNorm, pyNorm, src, mode, radius);
 
     // Person icon
     ctx.beginPath();
@@ -253,7 +277,9 @@ export default function ThreatSimulation() {
       try {
         const s = await getStats();
         setPersons(s?.active_tracks ?? 0);
-      } catch { /* ignore */ }
+      } catch {
+        setPersons(0);
+      }
     };
     poll();
     const id = setInterval(poll, 3000);
@@ -329,17 +355,34 @@ export default function ThreatSimulation() {
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
   }, [draw]);
 
-  // ── Canvas click → place source ───────────────────────────────────
-  const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+  const placeSrcPoint = useCallback((clientX: number, clientY: number) => {
     if (running) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     setSrcPoint({
-      x: (e.clientX - rect.left) / rect.width,
-      y: (e.clientY - rect.top)  / rect.height,
+      x: (clientX - rect.left) / rect.width,
+      y: (clientY - rect.top)  / rect.height,
     });
   }, [running]);
+
+  // ── Canvas click → place source ───────────────────────────────────
+  const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    placeSrcPoint(e.clientX, e.clientY);
+  }, [placeSrcPoint]);
+
+  // ── Canvas keyboard → place source ────────────────────────────────
+  const handleCanvasKeyDown = useCallback((e: React.KeyboardEvent<HTMLCanvasElement>) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      placeSrcPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    } else if (e.key === "Escape") {
+      setSrcPoint(null);
+    }
+  }, [placeSrcPoint]);
 
   // ── Controls ──────────────────────────────────────────────────────
   const start = () => {
@@ -359,29 +402,32 @@ export default function ThreatSimulation() {
     setMode("idle");
   };
 
+  const personsInZone = running ? getPersonsInZone(persons, srcPoint, mode, radius) : 0;
+
   const handleLogAlert = async () => {
     if (!srcPoint || mode === "idle" || logBusy) return;
     setLogBusy(true);
     const radiusPct = Math.round(radius * 100);
-    const result = await logSimulationAlert(
-      mode as "chemical" | "bio",
-      persons,
-      radiusPct
-    );
-    if (result) {
-      const now = new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
-      setAlertLog(prev => [{
-        id: String(result.id),
-        time: now,
-        mode: mode as "chemical" | "bio",
-        persons,
-        radius: radiusPct,
-      }, ...prev].slice(0, 6));
+    try {
+      const result = await logSimulationAlert(
+        mode as "chemical" | "bio",
+        personsInZone,
+        radiusPct
+      );
+      if (result) {
+        const now = new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
+        setAlertLog(prev => [{
+          id: String(result.id),
+          time: now,
+          mode: mode as "chemical" | "bio",
+          persons: personsInZone,
+          radius: radiusPct,
+        }, ...prev].slice(0, 6));
+      }
+    } finally {
+      setLogBusy(false);
     }
-    setLogBusy(false);
   };
-
-  const personsInZone = running && radius > 0 ? persons : 0;
   const fmtTime = (s: number) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
   return (
@@ -420,9 +466,13 @@ export default function ThreatSimulation() {
 
             <canvas
               ref={canvasRef}
-              className="absolute inset-0 w-full h-full"
+              className="absolute inset-0 w-full h-full focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-accent"
               style={{ cursor: running ? "default" : (mode !== "idle" ? "crosshair" : "default") }}
               onClick={handleCanvasClick}
+              onKeyDown={handleCanvasKeyDown}
+              tabIndex={0}
+              role="button"
+              aria-label="Place source (Enter/Space)"
             />
 
             {/* Overlay instructions */}

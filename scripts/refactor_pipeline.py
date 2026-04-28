@@ -1,4 +1,6 @@
 import re
+import os
+import textwrap
 from pathlib import Path
 
 path = Path('core/pipeline.py')
@@ -10,12 +12,12 @@ if not match:
     print('Inner loop body not found')
     exit(1)
 
-inner_body = match.group(0)
+inner_body = textwrap.dedent(match.group(0))
 
 # Build the new block
 new_block = '''
         IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
-        is_image_source = isinstance(self.source, str) and Path(self.source).suffix.lower() in IMAGE_EXTS
+        is_image_source = isinstance(self.source, str) and os.path.splitext(self.source)[1].lower() in IMAGE_EXTS
 
         if is_image_source:
             frame = cv2.imread(str(self.source))
@@ -28,7 +30,7 @@ new_block = '''
 '''
 
 for line in inner_body.split('\n'):
-    new_block += '        ' + line + '\n'
+    new_block += '                ' + line + '\n'
 
 new_block += '''                stream_manager.update_frame(frame)
                 self._frame_count += 1
@@ -40,12 +42,17 @@ new_block += '''                stream_manager.update_frame(frame)
             return
 '''
 
+# Check if new_block already exists
+if 'is_image_source =' in content and 'IMAGE_EXTS = {' in content:
+    print('Injection already present, skipping.')
+    exit(0)
+
 # Find where to insert it: after `is_file_source = isinstance(self.source, str) and os.path.isfile(self.source)`
 insert_target = 'is_file_source = isinstance(self.source, str) and os.path.isfile(self.source)'
 if insert_target not in content:
     print('Insert target not found')
     exit(1)
 
-new_content = content.replace(insert_target, insert_target + '\n' + new_block)
+new_content = content.replace(insert_target, insert_target + '\n' + new_block, 1)
 path.write_text(new_content, 'utf-8')
 print('Success')

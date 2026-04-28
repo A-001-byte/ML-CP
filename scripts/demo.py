@@ -7,6 +7,11 @@ Usage:
 """
 import argparse, requests, time, json, sys
 
+def checked_request(method, url, timeout=10, **kwargs):
+    response = requests.request(method, url, timeout=timeout, **kwargs)
+    response.raise_for_status()
+    return response
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--host', default='http://localhost:5000')
@@ -17,15 +22,17 @@ def main():
     BASE = f'{args.host}/api'
 
     # Login
-    r = requests.post(f'{BASE}/login', json={'username': args.username, 'password': args.password})
-    if r.status_code != 200:
-        sys.exit(f'Login failed: {r.text}')
-    token = r.json()['token']
+    try:
+        r = checked_request('POST', f'{BASE}/login', json={'username': args.username, 'password': args.password})
+        token = r.json()['token']
+    except requests.exceptions.RequestException as e:
+        sys.exit(f'Login failed: {e}')
+
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
     print(f'[demo] Logged in as {args.username}')
 
     # List footage
-    r = requests.get(f'{BASE}/footage', headers=headers)
+    r = checked_request('GET', f'{BASE}/footage', headers=headers)
     sources = r.json().get('sources', [])
     print(f'[demo] Available sources: {[s["label"] for s in sources]}')
 
@@ -35,32 +42,41 @@ def main():
             continue
         
         print(f'\n[demo] Switching to: {source["label"]}')
-        r = requests.post(f'{BASE}/pipeline/switch_source', headers=headers,
-                         json={'source': source['value']})
-        if r.status_code != 200:
-            print(f'  Switch failed: {r.text}')
+        try:
+            r = checked_request('POST', f'{BASE}/pipeline/switch_source', headers=headers, json={'source': source['value']})
+            print(f'  {r.json()["message"]}')
+        except requests.exceptions.RequestException as e:
+            print(f'  Switch failed: {e}')
             continue
         
-        print(f'  {r.json()["message"]}')
         time.sleep(2)
 
         # Poll stats while video plays
         for i in range(8):
             time.sleep(3)
-            s = requests.get(f'{BASE}/system_status').json()
-            stats = requests.get(f'{BASE}/stats', headers=headers).json()
-            print(f'  t+{(i+1)*3}s | FPS:{s.get("fps",0):.1f} | '
-                  f'Alerts:{stats["total_alerts"]} | Incidents:{stats["total_incidents"]}')
+            try:
+                s = checked_request('GET', f'{BASE}/system_status').json()
+                stats = checked_request('GET', f'{BASE}/stats', headers=headers).json()
+                print(f'  t+{(i+1)*3}s | FPS:{s.get("fps",0):.1f} | '
+                      f'Alerts:{stats["total_alerts"]} | Incidents:{stats["total_incidents"]}')
+            except requests.exceptions.RequestException as e:
+                print(f'  Poll failed: {e}')
 
     # Switch back to webcam
-    requests.post(f'{BASE}/pipeline/switch_source', headers=headers, json={'source': '0'})
+    try:
+        checked_request('POST', f'{BASE}/pipeline/switch_source', headers=headers, json={'source': '0'})
+    except requests.exceptions.RequestException:
+        pass
     print('\n[demo] Switched back to webcam. Demo complete.')
 
     # Final stats
-    final = requests.get(f'{BASE}/stats', headers=headers).json()
-    print(f'\n=== FINAL STATS ===')
-    for k, v in final.items():
-        print(f'  {k}: {v}')
+    try:
+        final = checked_request('GET', f'{BASE}/stats', headers=headers).json()
+        print(f'\n=== FINAL STATS ===')
+        for k, v in final.items():
+            print(f'  {k}: {v}')
+    except requests.exceptions.RequestException as e:
+        print(f'Failed to get final stats: {e}')
 
 if __name__ == '__main__':
     main()

@@ -186,6 +186,7 @@ class AlertManager:
 
             except Exception:
                 logger.exception("Failed to persist alert/incident to DB")
+                return None
         
         if "id" not in alert:
             alert["id"] = int(time.time() * 1000)

@@ -955,9 +955,9 @@ export default function LiveMonitor() {
                     </tr>
                   </thead>
                   <tbody>
-                    {alerts.slice(0, 15).map((a, index) => (
+                    {alerts.slice(0, 15).map((a) => (
                       <tr
-                        key={a.id ? `${a.id}-${index}` : `alert-row-${index}`}
+                        key={a.id ? String(a.id) : `${a.event_type}-${a.timestamp}-${a.camera_id}-${a.person_id}`}
                         className="transition-colors"
                         style={{ borderBottom: '1px solid var(--border)' }}
                         onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.02)'; }}
@@ -1073,13 +1073,13 @@ export default function LiveMonitor() {
                   No active threats
                 </div>
               )}
-              {activeAlerts.map((alert, index) => {
+              {activeAlerts.map((alert) => {
                 const isHighRisk =
                   alert.risk_level?.toLowerCase() === "high" ||
                   alert.risk_level?.toLowerCase() === "critical";
                 return (
                   <div
-                    key={alert.id ? `${alert.id}-${index}` : `active-alert-${index}`}
+                    key={alert.id ? String(alert.id) : `${alert.event_type}-${alert.timestamp}-${alert.camera_id}-${alert.person_id}`}
                     className="p-3 transition-colors animate-fade-in"
                     style={{
                       borderBottom: '1px solid var(--border)',
