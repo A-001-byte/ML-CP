@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Camera, ClipboardCopy, Check, Maximize2, VideoOff, X } from "lucide-react";
 import { getCameraFeedUrl, getCameras } from "@/lib/api";
 
@@ -74,25 +74,36 @@ export default function CameraGrid() {
   const [selected, setSelected] = useState<CameraInfo | null>(null);
   const [loading, setLoading] = useState(true);
 
+  const abortRef = useRef<AbortController | null>(null);
+
   const fetchCameras = useCallback(async () => {
+    // Abort any in-flight request before starting a new one
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
       const payload = await getCameras();
+      if (controller.signal.aborted) return;
       const list = Array.isArray(payload)
         ? payload.map(cameraFromUnknown).filter((camera): camera is CameraInfo => camera !== null)
         : [];
       setCameras(list);
     } catch (err) {
+      if (controller.signal.aborted) return;
       console.error("Failed to load cameras", err);
       setCameras([]);
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     fetchCameras();
     const timer = window.setInterval(fetchCameras, 5000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      if (abortRef.current) abortRef.current.abort();
+    };
   }, [fetchCameras]);
 
   return (

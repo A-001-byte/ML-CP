@@ -68,9 +68,15 @@ function StatCard({
 function formatHourLabel(hour: string): string {
   // hour could be "2026-04-28T14:00:00" or "14" or "14:00"
   if (hour.includes("T")) {
+    // Extract hour directly from ISO string to avoid local timezone conversion
+    const match = hour.match(/T(\d{2})/);
+    if (match) return `${match[1]}:00`;
+    // Fallback to UTC parsing
     const d = new Date(hour);
-    return `${d.getHours().toString().padStart(2, "0")}:00`;
+    if (!isNaN(d.getTime())) return `${d.getUTCHours().toString().padStart(2, "0")}:00`;
+    return hour;
   }
+  if (hour.includes(":")) return hour.slice(0, 2).padStart(2, "0") + ":00";
   const h = parseInt(hour, 10);
   if (!isNaN(h)) return `${h.toString().padStart(2, "0")}:00`;
   return hour;
@@ -139,13 +145,13 @@ function Last24HoursChart({ data }: { data: HourPoint[] }) {
 
 function formatDayLabel(dateStr: string): string {
   // dateStr could be "2026-04-28" or "04-28"
-  try {
-    const d = new Date(dateStr.length <= 5 ? `2026-${dateStr}` : dateStr);
-    const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    return `${days[d.getDay()]} ${d.getMonth() + 1}/${d.getDate()}`;
-  } catch {
-    return dateStr.slice(5);
-  }
+  const fullDate = dateStr.length <= 5
+    ? `${new Date().getFullYear()}-${dateStr}`
+    : dateStr;
+  const d = new Date(fullDate + "T00:00:00"); // Force midnight local to avoid timezone date shifts
+  if (isNaN(d.getTime())) return dateStr;
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  return `${days[d.getDay()]} ${d.getMonth() + 1}/${d.getDate()}`;
 }
 
 function Last7DaysChart({ data }: { data: DayPoint[] }) {

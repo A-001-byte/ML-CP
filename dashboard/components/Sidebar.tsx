@@ -41,9 +41,11 @@ export default function Sidebar({ className = "" }: { className?: string }) {
       if (res.ok) {
         const data = await res.json();
         setAlertCount(typeof data.high_risk_alerts === "number" ? data.high_risk_alerts : 0);
+      } else {
+        setAlertCount(0);
       }
     } catch {
-      // ignore
+      setAlertCount(0);
     }
   }, []);
 

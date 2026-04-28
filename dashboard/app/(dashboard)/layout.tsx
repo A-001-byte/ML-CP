@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { usePathname } from "next/navigation";
 import { Menu, X } from "lucide-react";
 import Sidebar from "@/components/Sidebar";
 import AuthProvider from "@/components/AuthProvider";
@@ -13,6 +14,7 @@ export default function DashboardLayout({
 }>) {
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const [isMobile, setIsMobile] = useState(false);
+    const pathname = usePathname();
 
     useEffect(() => {
         const check = () => setIsMobile(window.innerWidth < 768);
@@ -21,14 +23,16 @@ export default function DashboardLayout({
         return () => window.removeEventListener("resize", check);
     }, []);
 
-    // Close sidebar when navigating on mobile
+    // Close sidebar on route change (mobile) or when switching to desktop
     useEffect(() => {
-        if (!isMobile) setSidebarOpen(false);
-    }, [isMobile]);
+        if (isMobile) {
+            setSidebarOpen(false);
+        }
+    }, [pathname, isMobile]);
 
     return (
         <AuthProvider>
-            <div className="flex h-screen w-full">
+            <div className="dashboard-shell flex h-screen w-full">
                 {/* Mobile backdrop */}
                 {isMobile && sidebarOpen && (
                     <div

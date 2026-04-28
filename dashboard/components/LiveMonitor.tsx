@@ -790,8 +790,11 @@ export default function LiveMonitor() {
                     feedErrorCount.current += 1;
                     if (!hasTriedStream.current && streamUrl) {
                       hasTriedStream.current = true;
-                      setCurrentFeed(streamUrl);
-                      return;
+                      if (currentFeed !== streamUrl) {
+                        setCurrentFeed(streamUrl);
+                        return;
+                      }
+                      // currentFeed already is streamUrl — fall through to error handling
                     }
                     if (feedErrorCount.current >= 3) {
                       setFeedStatus("offline");
@@ -842,8 +845,10 @@ export default function LiveMonitor() {
                       hasTriedStream.current = false;
                       setFeedStatus("loading");
                       const base = process.env.NEXT_PUBLIC_VIDEO_FEED_URL || "http://localhost:5000/api/video_feed";
-                      const url = token ? `${base}?token=${encodeURIComponent(token)}&ts=${Date.now()}` : `${base}?ts=${Date.now()}`;
-                      setCurrentFeed(url);
+                      const retryUrl = new URL(base);
+                      if (token) retryUrl.searchParams.append("token", token);
+                      retryUrl.searchParams.append("ts", Date.now().toString());
+                      setCurrentFeed(retryUrl.toString());
                     }}
                   >
                     <RefreshCw className="w-3 h-3" />

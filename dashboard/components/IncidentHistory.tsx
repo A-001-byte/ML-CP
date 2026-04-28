@@ -394,9 +394,7 @@ export default function IncidentHistory() {
                   style={{ background: "var(--bg-primary)", border: "1px solid var(--border)" }}
                   src={getIncidentClipUrl(selectedIncident.id)}
                   onError={() => setClipError(true)}
-                >
-                  <track kind="captions" label="Captions" default />
-                </video>
+                />
               ) : (
                 <div className="rounded-md p-6 text-sm text-center" style={{ background: "var(--bg-primary)", border: "1px solid var(--border)", color: "var(--text-muted)" }}>
                   Clip not available

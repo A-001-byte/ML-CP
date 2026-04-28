@@ -327,11 +327,11 @@ body {
 /* ── Mobile Responsiveness ─────────────────────────────────────────── */
 
 @media (max-width: 768px) {
-  .grid {
+  .dashboard-shell .grid {
     grid-template-columns: 1fr !important;
   }
 
-  [class*="col-span"] {
+  .dashboard-shell [class*="col-span"] {
     grid-column: span 1 !important;
   }
 
@@ -366,3 +366,4 @@ body {
     padding: 8px 10px;
   }
 }
+
