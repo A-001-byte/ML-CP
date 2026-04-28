@@ -105,6 +105,16 @@ body {
   to { width: 0%; }
 }
 
+@keyframes deplete {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
 .animate-fade-in {
   animation: fade-in 0.2s ease-out;
 }
@@ -118,7 +128,8 @@ body {
 }
 
 .weapon-toast-progress {
-  animation: toast-drain 8s linear forwards;
+  animation: deplete 8s linear forwards;
+  transform-origin: left;
 }
 
 /* ── Panel Styles ──────────────────────────────────────────────────── */
@@ -312,3 +323,47 @@ body {
   letter-spacing: 0.04em;
   color: var(--text-muted);
 }
+
+/* ── Mobile Responsiveness ─────────────────────────────────────────── */
+
+@media (max-width: 768px) {
+  .dashboard-shell .grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  .dashboard-shell [class*="col-span"] {
+    grid-column: span 1 !important;
+  }
+
+  .aspect-video {
+    width: 100%;
+  }
+
+  .weapon-toast-container {
+    top: auto !important;
+    bottom: 1rem !important;
+    right: 0.5rem !important;
+    left: 0.5rem !important;
+    width: auto !important;
+    max-width: none !important;
+  }
+
+  .panel-body {
+    padding: 12px;
+  }
+  .panel-header {
+    padding: 10px 12px;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+}
+
+@media (max-width: 480px) {
+  .panel-body {
+    padding: 8px;
+  }
+  .panel-header {
+    padding: 8px 10px;
+  }
+}
+

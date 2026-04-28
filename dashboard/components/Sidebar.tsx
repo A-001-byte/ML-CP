@@ -12,6 +12,7 @@ import {
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useAuth } from "@/components/AuthProvider";
+import { apiFetch } from "@/lib/api";
 
 interface PipelineStatus {
   pipeline_running: boolean;
@@ -22,16 +23,29 @@ export default function Sidebar({ className = "" }: { className?: string }) {
   const pathname = usePathname();
   const { role } = useAuth();
   const [status, setStatus] = useState<PipelineStatus | null>(null);
+  const [alertCount, setAlertCount] = useState(0);
 
   const fetchStatus = useCallback(async () => {
+    const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
     try {
-      const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
       const res = await fetch(`${API_BASE}/system_status`);
       if (res.ok) {
         setStatus(await res.json());
       }
     } catch {
       setStatus(null);
+    }
+    // Fetch active alert count for badge (requires auth)
+    try {
+      const res = await apiFetch("/stats");
+      if (res.ok) {
+        const data = await res.json();
+        setAlertCount(typeof data.high_risk_alerts === "number" ? data.high_risk_alerts : 0);
+      } else {
+        setAlertCount(0);
+      }
+    } catch {
+      setAlertCount(0);
     }
   }, []);
 
@@ -126,12 +140,13 @@ export default function Sidebar({ className = "" }: { className?: string }) {
         {navItems.map((item) => {
           const Icon = item.icon;
           const isActive = pathname?.startsWith(item.path);
+          const showBadge = item.id === "monitor" && alertCount > 0;
 
           return (
             <Link
               key={item.id}
               href={item.path}
-              className="w-full flex items-center gap-2.5 px-3 py-2 rounded-md transition-all text-sm"
+              className="w-full flex items-center gap-2.5 px-3 py-2 rounded-md transition-all text-sm relative"
               style={{
                 background: isActive ? 'var(--accent-dim)' : 'transparent',
                 color: isActive ? 'var(--accent)' : 'var(--text-secondary)',
@@ -141,6 +156,21 @@ export default function Sidebar({ className = "" }: { className?: string }) {
             >
               <Icon className="w-4 h-4" />
               <span>{item.label}</span>
+              {showBadge && (
+                <span
+                  className="ml-auto flex items-center justify-center text-[9px] font-bold rounded-full"
+                  style={{
+                    minWidth: '18px',
+                    height: '18px',
+                    padding: '0 5px',
+                    background: 'var(--danger)',
+                    color: 'white',
+                    boxShadow: '0 0 6px rgba(239,68,68,0.4)',
+                  }}
+                >
+                  {alertCount > 99 ? "99+" : alertCount}
+                </span>
+              )}
             </Link>
           );
         })}

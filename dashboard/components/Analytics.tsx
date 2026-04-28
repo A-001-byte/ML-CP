@@ -65,28 +65,75 @@ function StatCard({
   );
 }
 
+function formatHourLabel(hour: string): string {
+  // hour could be "2026-04-28T14:00:00" or "14" or "14:00"
+  if (hour.includes("T")) {
+    // Extract hour directly from ISO string to avoid local timezone conversion
+    const match = hour.match(/T(\d{2})/);
+    if (match) return `${match[1]}:00`;
+    // Fallback to UTC parsing
+    const d = new Date(hour);
+    if (!isNaN(d.getTime())) return `${d.getUTCHours().toString().padStart(2, "0")}:00`;
+    return hour;
+  }
+  if (hour.includes(":")) return hour.slice(0, 2).padStart(2, "0") + ":00";
+  const h = parseInt(hour, 10);
+  if (!isNaN(h)) return `${h.toString().padStart(2, "0")}:00`;
+  return hour;
+}
+
 function Last24HoursChart({ data }: { data: HourPoint[] }) {
   const width = 720;
   const height = 260;
-  const padding = 36;
+  const padding = 48;
+  const rightPad = 36;
   const max = Math.max(1, ...data.map((item) => item.count));
-  const slot = (width - padding * 2) / Math.max(1, data.length);
+  const allZero = data.every((item) => item.count === 0);
+  const slot = (width - padding - rightPad) / Math.max(1, data.length);
   const barWidth = Math.max(4, slot * 0.62);
+  const chartH = height - padding * 2;
+  const yTicks = [0, 0.25, 0.5, 0.75, 1].map((f) => ({
+    y: height - padding - chartH * f,
+    label: Math.round(max * f).toString(),
+  }));
+  const showEvery = data.length <= 12 ? 1 : data.length <= 18 ? 2 : 3;
+
+  if (allZero) {
+    return (
+      <div className="flex flex-col items-center justify-center h-72 gap-2">
+        <Activity className="w-8 h-8" style={{ color: "var(--text-dim)" }} />
+        <span className="text-sm" style={{ color: "var(--text-muted)" }}>No data yet</span>
+        <span className="text-xs" style={{ color: "var(--text-dim)" }}>Alerts will appear here once detections begin</span>
+      </div>
+    );
+  }
 
   return (
     <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-72">
-      <line x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} stroke="rgba(255,255,255,0.12)" />
+      {/* Y-axis gridlines + labels */}
+      {yTicks.map((tick) => (
+        <g key={tick.label + tick.y}>
+          <line x1={padding} y1={tick.y} x2={width - rightPad} y2={tick.y} stroke="rgba(255,255,255,0.06)" strokeDasharray="4 4" />
+          <text x={padding - 8} y={tick.y + 4} textAnchor="end" fontSize="9" fill="var(--text-dim)">{tick.label}</text>
+        </g>
+      ))}
+      {/* Bars */}
       {data.map((item, index) => {
-        const barHeight = ((height - padding * 2) * item.count) / max;
+        const barHeight = (chartH * item.count) / max;
         const x = padding + index * slot + (slot - barWidth) / 2;
         const y = height - padding - barHeight;
         const alpha = 0.3 + (item.count / max) * 0.7;
         return (
           <g key={`${item.hour}-${index}`}>
             <rect x={x} y={y} width={barWidth} height={barHeight} rx="4" fill={`rgba(59,130,246,${alpha})`} />
-            {index % 3 === 0 && (
+            {item.count > 0 && (
+              <text x={x + barWidth / 2} y={y - 6} textAnchor="middle" fontSize="9" fontWeight="600" fill="var(--text-secondary)">
+                {item.count}
+              </text>
+            )}
+            {index % showEvery === 0 && (
               <text x={x + barWidth / 2} y={height - 12} textAnchor="middle" fontSize="10" fill="var(--text-muted)">
-                {item.hour}
+                {formatHourLabel(item.hour)}
               </text>
             )}
           </g>
@@ -96,28 +143,68 @@ function Last24HoursChart({ data }: { data: HourPoint[] }) {
   );
 }
 
+function formatDayLabel(dateStr: string): string {
+  // dateStr could be "2026-04-28" or "04-28"
+  const fullDate = dateStr.length <= 5
+    ? `${new Date().getFullYear()}-${dateStr}`
+    : dateStr;
+  const d = new Date(fullDate + "T00:00:00"); // Force midnight local to avoid timezone date shifts
+  if (isNaN(d.getTime())) return dateStr;
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  return `${days[d.getDay()]} ${d.getMonth() + 1}/${d.getDate()}`;
+}
+
 function Last7DaysChart({ data }: { data: DayPoint[] }) {
   const width = 720;
   const height = 260;
-  const padding = 38;
+  const padding = 48;
+  const rightPad = 36;
   const max = Math.max(1, ...data.map((item) => item.count));
-  const step = (width - padding * 2) / Math.max(1, data.length - 1);
+  const allZero = data.every((item) => item.count === 0);
+  const chartH = height - padding * 2;
+  const step = (width - padding - rightPad) / Math.max(1, data.length - 1);
   const points = data.map((item, index) => {
     const x = padding + step * index;
-    const y = height - padding - ((height - padding * 2) * item.count) / max;
-    return { x, y, label: item.date.slice(5), count: item.count };
+    const y = height - padding - (chartH * item.count) / max;
+    return { x, y, label: formatDayLabel(item.date), count: item.count };
   });
   const line = points.map((point) => `${point.x},${point.y}`).join(" ");
-  const area = `${padding},${height - padding} ${line} ${width - padding},${height - padding}`;
+  const area = `${padding},${height - padding} ${line} ${width - rightPad},${height - padding}`;
+  const yTicks = [0, 0.25, 0.5, 0.75, 1].map((f) => ({
+    y: height - padding - chartH * f,
+    label: Math.round(max * f).toString(),
+  }));
+
+  if (allZero) {
+    return (
+      <div className="flex flex-col items-center justify-center h-72 gap-2">
+        <TrendingUp className="w-8 h-8" style={{ color: "var(--text-dim)" }} />
+        <span className="text-sm" style={{ color: "var(--text-muted)" }}>No data yet</span>
+        <span className="text-xs" style={{ color: "var(--text-dim)" }}>Trend data will appear after the first day of detections</span>
+      </div>
+    );
+  }
 
   return (
     <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-72">
+      {/* Y-axis gridlines + labels */}
+      {yTicks.map((tick) => (
+        <g key={tick.label + tick.y}>
+          <line x1={padding} y1={tick.y} x2={width - rightPad} y2={tick.y} stroke="rgba(255,255,255,0.06)" strokeDasharray="4 4" />
+          <text x={padding - 8} y={tick.y + 4} textAnchor="end" fontSize="9" fill="var(--text-dim)">{tick.label}</text>
+        </g>
+      ))}
       <polygon points={area} fill="rgba(34,197,94,0.08)" />
       <polyline points={line} fill="none" stroke="#22c55e" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
       {points.map((point) => (
         <g key={point.label}>
           <circle cx={point.x} cy={point.y} r="5" fill="#22c55e" />
-          <text x={point.x} y={height - 12} textAnchor="middle" fontSize="11" fill="var(--text-muted)">
+          {point.count > 0 && (
+            <text x={point.x} y={point.y - 12} textAnchor="middle" fontSize="10" fontWeight="600" fill="var(--text-secondary)">
+              {point.count}
+            </text>
+          )}
+          <text x={point.x} y={height - 12} textAnchor="middle" fontSize="10" fill="var(--text-muted)">
             {point.label}
           </text>
         </g>

@@ -26,7 +26,12 @@ import threading
 import time
 
 # Ensure project root is importable
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, _project_root)
+
+# Load .env from project root so env vars are available everywhere
+from dotenv import load_dotenv
+load_dotenv(os.path.join(_project_root, ".env"))
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
