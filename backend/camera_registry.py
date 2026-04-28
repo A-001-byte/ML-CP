@@ -165,6 +165,9 @@ class CameraRegistry:
             while state.running:
                 ret, frame = cap.read()
                 if not ret:
+                    if isinstance(src, str) and not src.startswith(('http', 'rtsp')):
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        continue
                     _log.warning("[cameras] %s: frame grab failed", state.config.id)
                     break
                 state.update_frame(frame)

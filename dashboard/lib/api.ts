@@ -250,6 +250,44 @@ export async function getAnalytics() {
   return res.json();
 }
 
+export async function listFootage(): Promise<{ files: string[]; sources: { label: string; value: string }[] }> {
+  const res = await apiFetch("/footage");
+  if (!res.ok) return { files: [], sources: [{ label: "Webcam (Live)", value: "0" }] };
+  return res.json();
+}
+
+export async function switchPipelineSource(source: string): Promise<{ message: string; source: string }> {
+  const res = await apiFetch("/pipeline/switch_source", {
+    method: "POST",
+    body: JSON.stringify({ source }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Failed to switch source");
+  return res.json();
+}
+
+export async function logSimulationAlert(
+  threatType: "chemical" | "bio",
+  personsAffected: number,
+  spreadRadiusPct: number,
+  location = "Simulation Zone"
+): Promise<{ message: string; id: number; timestamp: string } | null> {
+  try {
+    const res = await apiFetch("/simulation/alert", {
+      method: "POST",
+      body: JSON.stringify({
+        threat_type: threatType,
+        persons_affected: personsAffected,
+        location,
+        spread_radius_pct: spreadRadiusPct,
+      }),
+    });
+    if (!res.ok) return null;
+    return res.json();
+  } catch {
+    return null;
+  }
+}
+
 // ── User management ───────────────────────────────────────────────────────────
 
 export interface CreateUserData {

@@ -6,6 +6,7 @@ import {
   AlertCircle,
   BarChart3,
   Camera,
+  FlaskConical,
   Users,
   Shield,
 } from "lucide-react";
@@ -82,6 +83,13 @@ export default function Sidebar({ className = "" }: { className?: string }) {
       path: "/analytics",
       label: "Analytics",
       icon: BarChart3,
+      roles: null,
+    },
+    {
+      id: "simulation",
+      path: "/simulation",
+      label: "Simulation",
+      icon: FlaskConical,
       roles: null,
     },
     {
