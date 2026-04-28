@@ -339,3 +339,9 @@ export function getCameraFeedUrl(camId: string): string {
   const base = `${API_BASE}/cameras/${camId}/feed`;
   return _inMemToken ? `${base}?token=${encodeURIComponent(_inMemToken)}` : base;
 }
+
+/** Alias for backward compatibility — LiveMonitor imports this name. */
+export async function getFootageSources(): Promise<{label: string; value: string}[]> {
+  const data = await listFootage();
+  return data.sources || [];
+}

@@ -233,6 +233,12 @@ class SurveillancePipeline:
                 while True:
                     t0 = time.perf_counter()
 
+                    # Check stop flag every frame (not just outer loop)
+                    if self._stop_requested:
+                        print("[pipeline] Stop requested — exiting inner loop.")
+                        cap.release()
+                        return
+
                     ret, frame = cap.read()
                     if not ret:
                         if is_file_source:

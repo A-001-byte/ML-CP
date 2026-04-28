@@ -12,6 +12,7 @@ import {
   Download,
   Eye,
   Gauge,
+  Loader2,
   Monitor,
   Pencil,
   RefreshCw,
@@ -397,6 +398,7 @@ export default function LiveMonitor() {
   const [zoneSaving, setZoneSaving] = useState(false);
   const [weaponToasts, setWeaponToasts] = useState<WeaponToast[]>([]);
   const [feedStatus, setFeedStatus] = useState<"loading" | "connected" | "offline">("loading");
+
   const fallbackInterval = useRef<ReturnType<typeof setInterval> | null>(null);
   const hasTriedStream = useRef(false);
   const feedErrorCount = useRef(0);
@@ -455,7 +457,7 @@ export default function LiveMonitor() {
     document.title = weaponToasts.length > 0 ? "⚠ ALERT — ThreatSense-AI" : "ThreatSense-AI";
   }, [weaponToasts.length]);
 
-  // â”€â”€ Initial data load â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ── Initial data load ────────────────────────────────────────────────────────────────────────────
 
   const fetchData = useCallback(async () => {
     try {
@@ -642,6 +644,8 @@ export default function LiveMonitor() {
     }
   };
 
+  // handleSourceSwitch is defined above with useCallback
+
   // Derive device label from real metrics
   const deviceLabel = metrics?.gpu_available
     ? metrics.gpu_info?.name || "GPU"
@@ -737,6 +741,7 @@ export default function LiveMonitor() {
                 >
                   {zonePoints.length >= 3 ? "Zone Active" : "No Zone"}
                 </span>
+
                 <button
                   onClick={() => setDrawingZone((prev) => !prev)}
                   className="btn btn-ghost"

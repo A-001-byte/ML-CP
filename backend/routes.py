@@ -527,6 +527,51 @@ async def system_metrics(_user: Optional[dict] = Depends(get_optional_user)):
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PIPELINE SOURCE MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/footage")
+async def list_footage(_user: dict = Depends(get_current_user)):
+    """List available video files from the footage/ directory."""
+    footage_dir = PROJECT_ROOT / "footage"
+    if not footage_dir.exists():
+        return {"files": [], "sources": []}
+    files = sorted(f.name for f in footage_dir.glob("*.mp4"))
+    sources = [{"label": f, "value": f"footage/{f}"} for f in files]
+    return {"files": files, "sources": sources}
+
+
+class SwitchSourceRequest(BaseModel):
+    source: str
+
+
+@router.post("/pipeline/switch_source")
+async def switch_pipeline_source(
+    body: SwitchSourceRequest,
+    _user: dict = Depends(require_roles("admin", "operator")),
+):
+    """Switch the AI pipeline's video source (webcam or footage file)."""
+    source = body.source.strip()
+
+    # Validate source
+    if source not in ("0", ""):
+        candidate = PROJECT_ROOT / source
+        if not candidate.is_file():
+            raise HTTPException(status_code=400, detail=f"Source file not found: {source}")
+
+    # Update environment variable
+    import os as _os
+    _os.environ["PIPELINE_SOURCE"] = source if source != "0" else ""
+
+    # Restart the pipeline with new source
+    from backend.main import restart_pipeline
+    restart_pipeline()
+
+    return {"message": "Pipeline source switched", "source": source}
+
+
 def _parse_alert_ts(value: str) -> datetime | None:
     try:
         return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_IST)
