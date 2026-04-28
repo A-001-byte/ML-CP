@@ -12,6 +12,7 @@ import {
   Download,
   Eye,
   Gauge,
+  Loader2,
   Monitor,
   Pencil,
   Trash2,
@@ -26,9 +27,11 @@ import {
   dismissAlert,
   getAlerts,
   getDetectionZone,
+  getFootageSources,
   getStats,
   resolveAlert,
   bulkDismissAlerts,
+  switchPipelineSource,
   updateDetectionZone,
   clearDetectionZone,
   ZonePoint,
@@ -394,6 +397,9 @@ export default function LiveMonitor() {
   const [drawingZone, setDrawingZone] = useState(false);
   const [zoneSaving, setZoneSaving] = useState(false);
   const [weaponToasts, setWeaponToasts] = useState<WeaponToast[]>([]);
+  const [footageSources, setFootageSources] = useState<{ label: string; value: string }[]>([]);
+  const [pipelineSource, setPipelineSource] = useState<string>("0");
+  const [sourceLoading, setSourceLoading] = useState(false);
   const fallbackInterval = useRef<ReturnType<typeof setInterval> | null>(null);
   const hasTriedStream = useRef(false);
   const alarmMutedRef = useRef(alarmMuted);
@@ -450,6 +456,30 @@ export default function LiveMonitor() {
     if (typeof document === "undefined") return;
     document.title = weaponToasts.length > 0 ? "⚠ ALERT — ThreatSense-AI" : "ThreatSense-AI";
   }, [weaponToasts.length]);
+  // -- Pipeline source switch -----------------------------------------------
+
+  const handleSourceSwitch = useCallback(async (newSource: string) => {
+    if (newSource === pipelineSource || sourceLoading) return;
+    setPipelineSource(newSource);
+    setSourceLoading(true);
+    try {
+      await switchPipelineSource(newSource);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const base =
+        process.env.NEXT_PUBLIC_VIDEO_FEED_URL ||
+        "http://localhost:5000/api/video_feed";
+      const t = getApiToken();
+      const bounced = t
+        ? (base + "?token=" + encodeURIComponent(t) + "&ts=" + Date.now())
+        : (base + "?ts=" + Date.now());
+      setCurrentFeed(bounced);
+      hasTriedStream.current = false;
+    } catch {
+      setPipelineSource(pipelineSource);
+    } finally {
+      setSourceLoading(false);
+    }
+  }, [pipelineSource, sourceLoading]);
 
   // â”€â”€ Initial data load â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -495,6 +525,10 @@ export default function LiveMonitor() {
         const points = Array.isArray(zone.points) ? zone.points : [];
         setZonePoints(points);
       })
+      .catch(() => {});
+    // Fetch footage sources for source selector
+    getFootageSources()
+      .then((sources) => setFootageSources(sources))
       .catch(() => {});
     const metricsInterval = setInterval(fetchMetrics, 10000);
     return () => clearInterval(metricsInterval);
@@ -638,6 +672,8 @@ export default function LiveMonitor() {
     }
   };
 
+  // handleSourceSwitch is defined above with useCallback
+
   // Derive device label from real metrics
   const deviceLabel = metrics?.gpu_available
     ? metrics.gpu_info?.name || "GPU"
@@ -733,6 +769,49 @@ export default function LiveMonitor() {
                 >
                   {zonePoints.length >= 3 ? "Zone Active" : "No Zone"}
                 </span>
+
+                {/* ── Pipeline Source Selector ── */}
+                <div className="flex items-center gap-1.5">
+                  {sourceLoading ? (
+                    <Loader2
+                      className="w-3.5 h-3.5 animate-spin"
+                      style={{ color: "var(--accent)" }}
+                      aria-label="Switching pipeline source"
+                    />
+                  ) : (
+                    <Video className="w-3.5 h-3.5" style={{ color: "var(--text-muted)" }} />
+                  )}
+                  <select
+                    id="pipeline-source-selector"
+                    value={pipelineSource}
+                    disabled={sourceLoading}
+                    onChange={(e) => handleSourceSwitch(e.target.value)}
+                    aria-label="Select video source"
+                    style={{
+                      fontSize: "11px",
+                      fontFamily: "var(--font-sans)",
+                      fontWeight: 500,
+                      color: sourceLoading ? "var(--text-muted)" : "var(--text-primary)",
+                      background: "var(--bg-surface)",
+                      border: "1px solid var(--border-strong)",
+                      borderRadius: "4px",
+                      padding: "3px 24px 3px 8px",
+                      cursor: sourceLoading ? "not-allowed" : "pointer",
+                      outline: "none",
+                      appearance: "auto",
+                      maxWidth: "160px",
+                      transition: "border-color 0.15s ease",
+                    }}
+                  >
+                    <option value="0">Webcam (Live)</option>
+                    {footageSources.map((src) => (
+                      <option key={src.value} value={src.value}>
+                        {src.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
                 <button
                   onClick={() => setDrawingZone((prev) => !prev)}
                   className="btn btn-ghost"

@@ -86,8 +86,17 @@ def _parse_pipeline_source(raw_source: str | None) -> int | str:
     return source
 
 
+# ── Pipeline management globals ──────────────────────────────────────────────
+_pipeline_instance = None          # live SurveillancePipeline object
+_pipeline_thread: threading.Thread | None = None
+_pipeline_lock = threading.Lock()  # serialise restart requests
+_person_model_path: str = ""
+_weapon_model_path: str | None = None
+
+
 def _run_pipeline(person_model: str, weapon_model: str | None) -> None:
     """Start the AI surveillance pipeline (blocking — runs in a daemon thread)."""
+    global _pipeline_instance
     _log.info("Starting AI pipeline …")
     _log.info("  Person model: %s", person_model)
     _log.info("  Weapon model: %s", weapon_model)
@@ -124,9 +133,42 @@ def _run_pipeline(person_model: str, weapon_model: str | None) -> None:
             weapon_skip=int(os.environ.get("PIPELINE_WEAPON_SKIP", default_weapon_skip)),
             risk_skip=int(os.environ.get("PIPELINE_RISK_SKIP", default_risk_skip)),
         )
+        _pipeline_instance = pipeline
         pipeline.run()
     except Exception as e:
         _log.exception("AI pipeline crashed: %s", e)
+    finally:
+        _pipeline_instance = None
+
+
+def restart_pipeline() -> None:
+    """Stop the current AI pipeline and start a fresh one with the current env config.
+
+    Thread-safe — only one restart runs at a time.
+    Called by POST /api/pipeline/switch_source.
+    """
+    global _pipeline_thread, _pipeline_instance
+    with _pipeline_lock:
+        # 1. Signal the current pipeline to stop
+        if _pipeline_instance is not None:
+            _log.info("Requesting pipeline stop …")
+            _pipeline_instance._stop_requested = True
+
+        # 2. Wait for the old thread to finish (max 8s)
+        if _pipeline_thread is not None and _pipeline_thread.is_alive():
+            _pipeline_thread.join(timeout=8)
+            if _pipeline_thread.is_alive():
+                _log.warning("Pipeline thread did not stop within 8s — starting new one anyway")
+
+        # 3. Launch a new pipeline thread
+        _log.info("Restarting pipeline with source=%s", os.environ.get("PIPELINE_SOURCE", "0"))
+        _pipeline_thread = threading.Thread(
+            target=_run_pipeline,
+            args=(_person_model_path, _weapon_model_path),
+            daemon=True,
+            name="ai-pipeline",
+        )
+        _pipeline_thread.start()
 
 
 # ── Stats emitter ────────────────────────────────────────────────────────────
@@ -185,18 +227,19 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
     ws_manager.set_loop(loop)
 
-    # Resolve model paths
-    person_model, weapon_model = _resolve_models()
+    # Resolve model paths and store for restart use
+    global _person_model_path, _weapon_model_path, _pipeline_thread
+    _person_model_path, _weapon_model_path = _resolve_models()
 
     # Skip AI pipeline when running under pytest / CI
     if os.environ.get("THREATSENSE_NO_PIPELINE") != "1":
-        pipeline_thread = threading.Thread(
+        _pipeline_thread = threading.Thread(
             target=_run_pipeline,
-            args=(person_model, weapon_model),
+            args=(_person_model_path, _weapon_model_path),
             daemon=True,
             name="ai-pipeline",
         )
-        pipeline_thread.start()
+        _pipeline_thread.start()
     else:
         _log.info("THREATSENSE_NO_PIPELINE=1 — AI pipeline disabled (test mode)")
 

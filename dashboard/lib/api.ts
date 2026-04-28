@@ -301,3 +301,31 @@ export function getCameraFeedUrl(camId: string): string {
   const base = `${API_BASE}/cameras/${camId}/feed`;
   return _inMemToken ? `${base}?token=${encodeURIComponent(_inMemToken)}` : base;
 }
+
+// ── Pipeline source management ────────────────────────────────────────────────
+
+/** Fetch available footage video files from the footage/ directory. */
+export async function getFootageSources(): Promise<{label: string; value: string}[]> {
+  try {
+    const res = await apiFetch("/footage");
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.sources || [];
+  } catch {
+    return [];
+  }
+}
+
+/** Switch the AI pipeline's video source (e.g., "0" for webcam, "footage/Video.mp4" for file). */
+export async function switchPipelineSource(source: string): Promise<boolean> {
+  try {
+    const res = await apiFetch("/pipeline/switch_source", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}

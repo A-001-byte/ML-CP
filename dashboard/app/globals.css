@@ -105,6 +105,16 @@ body {
   to { width: 0%; }
 }
 
+@keyframes deplete {
+  from { transform: scaleX(1); }
+  to   { transform: scaleX(0); }
+}
+
+@keyframes shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
 .animate-fade-in {
   animation: fade-in 0.2s ease-out;
 }
@@ -118,7 +128,8 @@ body {
 }
 
 .weapon-toast-progress {
-  animation: toast-drain 8s linear forwards;
+  animation: deplete 8s linear forwards;
+  transform-origin: left;
 }
 
 /* ── Panel Styles ──────────────────────────────────────────────────── */
