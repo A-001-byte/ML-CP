@@ -114,50 +114,51 @@ class AlertManager:
             
         priority = self.rules.get_alert_priority(decision)
         
+        # Determine event_type from behaviors or reasons
+        behaviors = decision.get("behaviors", [])
+        if "weapon_detected" in behaviors:
+            event_type = "Weapon Detected"
+        elif "zone_intrusion" in behaviors:
+            event_type = "Zone Intrusion"
+        elif "loitering" in behaviors:
+            event_type = "Loitering Detected"
+        elif behaviors:
+            event_type = sorted(behaviors)[0].replace("_", " ").title()
+        else:
+            event_type = "Suspicious Behavior"
+        
+        # Normalize risk_score to 0.0-1.0 range
+        risk_score = normalize_risk_score(decision["risk_score"])
+        # Normalize threat_level to DB-supported risk_level
+        risk_level = normalize_threat_level(decision["threat_level"])
+        
         alert = {
-            "person_id": decision["person_id"],
-            "risk_score": decision["risk_score"],
+            "person_id": str(decision["person_id"]),
+            "event_type": event_type,
+            "risk_score": risk_score,
+            "risk_level": risk_level,
             "threat_level": decision["threat_level"],
             "priority": priority,
             "reasons": decision.get("reasons", []),
-            "timestamp": get_current_timestamp_str()
+            "timestamp": get_current_timestamp_str(),
+            "camera_id": self.camera_id,
+            "location": self.location,
+            "status": "Active"
         }
-        
-        self.alert_log.append(alert)
-
-        # Notify via WebSocket if available
-        if WS_AVAILABLE:
-            ws_manager.broadcast_alert(alert)
         
         # Persist to database if available
         if DB_AVAILABLE and db_add_alert is not None:
             try:
-                # Determine event_type from behaviors or reasons
-                behaviors = decision.get("behaviors", [])
-                if "weapon_detected" in behaviors:
-                    event_type = "Weapon Detected"
-                elif "zone_intrusion" in behaviors:
-                    event_type = "Zone Intrusion"
-                elif "loitering" in behaviors:
-                    event_type = "Loitering Detected"
-                elif behaviors:
-                    # Use sorted behaviors for deterministic event_type
-                    event_type = sorted(behaviors)[0].replace("_", " ").title()
-                else:
-                    event_type = "Suspicious Behavior"
-                
-                # Normalize risk_score to 0.0-1.0 range
-                risk_score = normalize_risk_score(decision["risk_score"])
-                # Normalize threat_level to DB-supported risk_level
-                risk_level = normalize_threat_level(decision["threat_level"])
-                
-                db_add_alert(
-                    person_id=str(decision["person_id"]),
-                    event_type=event_type,
-                    risk_score=risk_score,
-                    risk_level=risk_level,
-                    camera_id=self.camera_id
+                alert_id = db_add_alert(
+                    person_id=alert["person_id"],
+                    event_type=alert["event_type"],
+                    risk_score=alert["risk_score"],
+                    risk_level=alert["risk_level"],
+                    camera_id=alert["camera_id"],
+                    location=alert["location"],
+                    status=alert["status"]
                 )
+                alert["id"] = alert_id
 
                 # Promote high-priority detections to incidents
                 if db_add_incident is not None and risk_level in ("high", "critical"):
@@ -185,6 +186,16 @@ class AlertManager:
 
             except Exception:
                 logger.exception("Failed to persist alert/incident to DB")
+                return None
+        
+        if "id" not in alert:
+            alert["id"] = int(time.time() * 1000)
+            
+        self.alert_log.append(alert)
+
+        # Notify via WebSocket if available
+        if WS_AVAILABLE:
+            ws_manager.broadcast_alert(alert)
         
         # Compact log line (was verbose multi-line print block)
         reasons_str = "; ".join(alert["reasons"][:3])  # Show top 3 reasons

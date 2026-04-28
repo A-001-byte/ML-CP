@@ -1,0 +1,53 @@
+{
+  "profiled_at": "2026-04-28",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 3050 6GB Laptop GPU",
+    "cuda_version": "12.1",
+    "vram_total_mb": 6144
+  },
+  "inference_latency_ms": {
+    "person_detector": {
+      "model": "YOLOv8m",
+      "imgsz": 416,
+      "half_precision": true,
+      "device": "cuda:0",
+      "avg_ms": 21.0,
+      "min_ms": 13.6,
+      "max_ms": 129.8,
+      "implied_fps": 48
+    },
+    "weapon_detector": {
+      "model": "YOLOv8m (fine-tuned)",
+      "imgsz": 640,
+      "half_precision": true,
+      "device": "cuda:0",
+      "input": "person crop (lower 60%)",
+      "avg_ms": 25.8,
+      "min_ms": 16.9,
+      "max_ms": 35.7,
+      "implied_fps": 39
+    },
+    "end_to_end_per_frame": {
+      "description": "person detect + weapon detect on 2 persons",
+      "avg_ms": 69.4,
+      "theoretical_max_fps": 14
+    }
+  },
+  "live_pipeline_fps": {
+    "webcam_1280x720": 32,
+    "video_file_throttled": 24,
+    "note": "Live FPS includes ByteTrack tracking, WeaponVerifier, BehaviorAnalyzer, RiskEngine, and JPEG encoding. Weapon detection runs every 5 frames (weapon_skip=5), so effective throughput is higher."
+  },
+  "gpu_memory_at_runtime_mb": {
+    "allocated": 100,
+    "reserved": 176,
+    "headroom": 5968
+  },
+  "optimization_notes": [
+    "Both models use FP16 (half=True) reducing memory ~50% vs FP32",
+    "Weapon detection runs every 5 frames (weapon_skip=5) not every frame",
+    "Person detection runs every 1 frame on GPU, every 3 on CPU",
+    "Stream manager pre-encodes JPEG in pipeline thread — zero encoding cost on HTTP requests",
+    "ByteTrack persists track IDs across frames — no re-detection overhead"
+  ]
+}
