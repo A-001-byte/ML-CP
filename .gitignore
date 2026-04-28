@@ -30,6 +30,7 @@ models/*.onnx
 # Datasets (too large for git — see training/README for download instructions)
 datasets/
 weapon_merged.zip
+*.zip
 
 # YOLO training runs
 runs/

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Camera, Maximize2, VideoOff, X } from "lucide-react";
+import { Camera, ClipboardCopy, Check, Maximize2, VideoOff, X } from "lucide-react";
 import { getCameraFeedUrl, getCameras } from "@/lib/api";
 
 interface CameraInfo {
@@ -33,18 +33,36 @@ function cameraFromUnknown(value: unknown): CameraInfo | null {
 }
 
 function EmptyState() {
+  const [copied, setCopied] = useState(false);
+  const exampleJson = `CAMERAS_JSON='[\n  {"id":"front-door","source":0,"location":"Main Entrance"},\n  {"id":"back-lot","source":"rtsp://192.168.1.100/stream","location":"Back Lot"}\n]'`;
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(exampleJson);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch { /* ignore */ }
+  };
+
   return (
     <div className="panel">
       <div className="panel-body text-center py-12">
         <VideoOff className="w-10 h-10 mx-auto mb-4" style={{ color: "var(--text-muted)" }} />
         <h2 className="text-base font-semibold mb-2" style={{ color: "var(--text-primary)" }}>No cameras configured</h2>
-        <p className="text-sm mb-4" style={{ color: "var(--text-muted)" }}>Register cameras through the environment before starting the backend.</p>
-        <pre className="text-left text-xs rounded p-4 overflow-x-auto mx-auto max-w-3xl" style={{ background: "var(--bg-primary)", border: "1px solid var(--border)", color: "var(--text-secondary)" }}>
-{`CAMERAS_JSON='[
-  {"id":"front-door","source":0,"location":"Main Entrance"},
-  {"id":"back-lot","source":"rtsp://192.168.1.100/stream","location":"Back Lot"}
-]'`}
-        </pre>
+        <p className="text-sm mb-4" style={{ color: "var(--text-muted)" }}>Add cameras via the <code style={{ color: "var(--accent)" }}>CAMERAS_JSON</code> environment variable before starting the backend.</p>
+        <div className="relative mx-auto max-w-3xl">
+          <button
+            onClick={handleCopy}
+            className="absolute top-2 right-2 btn btn-ghost"
+            title={copied ? "Copied!" : "Copy to clipboard"}
+          >
+            {copied ? <Check className="w-3 h-3" style={{ color: "var(--success)" }} /> : <ClipboardCopy className="w-3 h-3" />}
+            {copied ? "Copied" : "Copy"}
+          </button>
+          <pre className="text-left text-xs rounded p-4 overflow-x-auto" style={{ background: "var(--bg-primary)", border: "1px solid var(--border)", color: "var(--text-secondary)" }}>
+{exampleJson}
+          </pre>
+        </div>
         <p className="text-xs mt-4" style={{ color: "var(--text-dim)" }}>The default webcam stream is always available at /api/video_feed.</p>
       </div>
     </div>
@@ -73,7 +91,7 @@ export default function CameraGrid() {
 
   useEffect(() => {
     fetchCameras();
-    const timer = window.setInterval(fetchCameras, 10000);
+    const timer = window.setInterval(fetchCameras, 5000);
     return () => window.clearInterval(timer);
   }, [fetchCameras]);
 
@@ -118,7 +136,12 @@ export default function CameraGrid() {
                   </div>
                   <p className="text-xs mt-1 truncate" style={{ color: "var(--text-muted)" }}>{camera.location}</p>
                 </div>
-                <span className="badge badge-low">{camera.fps.toFixed(1)} FPS</span>
+                <span className="badge" style={{
+                  color: camera.fps >= 15 ? "var(--success)" : camera.fps >= 5 ? "var(--warning)" : "var(--danger)",
+                  borderColor: camera.fps >= 15 ? "rgba(34,197,94,0.3)" : camera.fps >= 5 ? "rgba(245,158,11,0.3)" : "var(--danger-border)",
+                  background: camera.fps >= 15 ? "var(--success-dim)" : camera.fps >= 5 ? "var(--warning-dim)" : "var(--danger-dim)",
+                  transition: "all 0.3s ease",
+                }}>{camera.fps.toFixed(1)} FPS</span>
               </div>
             </button>
           ))}

@@ -14,8 +14,10 @@ import {
   Gauge,
   Monitor,
   Pencil,
+  RefreshCw,
   Trash2,
   Video,
+  VideoOff,
   Wifi,
   WifiOff,
   X,
@@ -394,8 +396,10 @@ export default function LiveMonitor() {
   const [drawingZone, setDrawingZone] = useState(false);
   const [zoneSaving, setZoneSaving] = useState(false);
   const [weaponToasts, setWeaponToasts] = useState<WeaponToast[]>([]);
+  const [feedStatus, setFeedStatus] = useState<"loading" | "connected" | "offline">("loading");
   const fallbackInterval = useRef<ReturnType<typeof setInterval> | null>(null);
   const hasTriedStream = useRef(false);
+  const feedErrorCount = useRef(0);
   const alarmMutedRef = useRef(alarmMuted);
 
   useEffect(() => {
@@ -677,7 +681,7 @@ export default function LiveMonitor() {
         </div>
       )}
 
-      <div className="fixed top-4 right-4 z-[9999] space-y-3 w-[340px] max-w-[calc(100vw-2rem)]">
+      <div className="weapon-toast-container fixed top-4 right-4 z-[9999] space-y-3 w-[340px] max-w-[calc(100vw-2rem)]">
         {weaponToasts.map((toast) => (
           <div
             key={toast.id}
@@ -775,27 +779,76 @@ export default function LiveMonitor() {
               style={{ background: '#0a0e14' }}
             >
               {/* Feed */}
-              {currentFeed ? (
+              {currentFeed && (
                 <img
                   id="camera-feed"
                   src={currentFeed}
                   alt="Live Camera Feed"
                   className="w-full h-full object-contain"
+                  style={{ display: feedStatus === "connected" ? "block" : "none" }}
                   onError={() => {
+                    feedErrorCount.current += 1;
                     if (!hasTriedStream.current && streamUrl) {
                       hasTriedStream.current = true;
                       setCurrentFeed(streamUrl);
                       return;
                     }
-                    startSnapshotFallback();
+                    if (feedErrorCount.current >= 3) {
+                      setFeedStatus("offline");
+                      stopSnapshotFallback();
+                    } else {
+                      startSnapshotFallback();
+                    }
                   }}
                   onLoad={() => {
+                    feedErrorCount.current = 0;
+                    setFeedStatus("connected");
                     if (currentFeed === streamUrl) stopSnapshotFallback();
                   }}
                 />
-              ) : (
-                <div className="w-full h-full flex items-center justify-center text-sm" style={{ color: 'var(--text-muted)' }}>
-                  Awaiting video signalâ€¦
+              )}
+
+              {/* Loading skeleton */}
+              {feedStatus === "loading" && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
+                  <div className="absolute inset-0 overflow-hidden">
+                    <div
+                      className="absolute inset-0"
+                      style={{
+                        background: 'linear-gradient(90deg, transparent 0%, rgba(59,130,246,0.06) 40%, rgba(59,130,246,0.10) 50%, rgba(59,130,246,0.06) 60%, transparent 100%)',
+                        animation: 'shimmer 2s ease-in-out infinite',
+                      }}
+                    />
+                  </div>
+                  <Video className="w-8 h-8 animate-pulse" style={{ color: 'var(--text-dim)' }} />
+                  <span className="text-xs font-medium" style={{ color: 'var(--text-muted)' }}>
+                    Connecting to video feed…
+                  </span>
+                </div>
+              )}
+
+              {/* Offline state */}
+              {feedStatus === "offline" && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
+                  <VideoOff className="w-10 h-10" style={{ color: 'var(--danger)' }} />
+                  <span className="text-sm font-semibold" style={{ color: 'var(--danger)' }}>Feed Offline</span>
+                  <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                    Unable to connect to video stream
+                  </span>
+                  <button
+                    className="btn btn-ghost mt-1"
+                    onClick={() => {
+                      feedErrorCount.current = 0;
+                      hasTriedStream.current = false;
+                      setFeedStatus("loading");
+                      const base = process.env.NEXT_PUBLIC_VIDEO_FEED_URL || "http://localhost:5000/api/video_feed";
+                      const url = token ? `${base}?token=${encodeURIComponent(token)}&ts=${Date.now()}` : `${base}?ts=${Date.now()}`;
+                      setCurrentFeed(url);
+                    }}
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    Retry
+                  </button>
                 </div>
               )}
 

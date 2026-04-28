@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, ArrowUp, Check, Download, Eye, Filter, Search, X } from "lucide-react";
+import { AlertTriangle, ArrowUp, Check, Download, Eye, Film, Filter, Search, X } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import { escalateIncident, getApiToken, getIncidentClipUrl, getIncidents, resolveIncident } from "@/lib/api";
 import { useWebSocket, WSMessage } from "@/lib/socket";
@@ -301,7 +301,19 @@ export default function IncidentHistory() {
                       return (
                         <tr key={incident.id} className="transition-colors last:border-0" style={{ borderBottom: "1px solid var(--border)" }}>
                           <td className="p-4 text-xs font-mono" style={{ color: "var(--text-muted)" }}>{incident.created_at}</td>
-                          <td className="p-4 text-xs" style={{ color: "var(--text-primary)" }}>{incident.event_type || incident.title}</td>
+                          <td className="p-4 text-xs" style={{ color: "var(--text-primary)" }}>
+                            {incident.event_type || incident.title}
+                            {incident.clip_path && (
+                              <span
+                                className="inline-flex items-center gap-1 ml-2 px-1.5 py-0.5 rounded text-[9px] font-medium"
+                                style={{ background: "var(--accent-dim)", color: "var(--accent)", border: "1px solid rgba(59,130,246,0.2)" }}
+                                title="Video clip available"
+                              >
+                                <Film className="w-2.5 h-2.5" />
+                                Clip
+                              </span>
+                            )}
+                          </td>
                           <td className="p-4 text-xs" style={{ color: "var(--text-muted)" }}>{incident.location}</td>
                           <td className="p-4"><span className={getRiskBadgeClass(incident.risk_level)}>{incident.risk_level?.toUpperCase()}</span></td>
                           <td className="p-4"><span className={getStatusBadgeClass(incident.status)}>{incident.status}</span></td>
@@ -382,7 +394,9 @@ export default function IncidentHistory() {
                   style={{ background: "var(--bg-primary)", border: "1px solid var(--border)" }}
                   src={getIncidentClipUrl(selectedIncident.id)}
                   onError={() => setClipError(true)}
-                />
+                >
+                  <track kind="captions" label="Captions" default />
+                </video>
               ) : (
                 <div className="rounded-md p-6 text-sm text-center" style={{ background: "var(--bg-primary)", border: "1px solid var(--border)", color: "var(--text-muted)" }}>
                   Clip not available
